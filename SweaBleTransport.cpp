@@ -8,7 +8,11 @@
 #ifndef SWEA_BLE_PASSKEY
 #define SWEA_BLE_PASSKEY 123456
 #endif
-#define SWEA_BLE_FW_STRING "swea-ble-0.1"
+#define SWEA_BLE_FW_STRING "swea-ble-0.2"
+// RAM for the record ring (newest data is kept when it is full; the SD card keeps everything).
+#ifndef SWEA_BLE_RING_BYTES
+#define SWEA_BLE_RING_BYTES 24576
+#endif
 
 namespace
 {
@@ -22,7 +26,8 @@ namespace
 		OP_GET_INFO = 0x01,
 		OP_START_STREAM = 0x02,
 		OP_STOP_STREAM = 0x03,
-		OP_TIME_SYNC = 0x04
+		OP_TIME_SYNC = 0x04,
+		OP_SET_PROFILE = 0x07
 	};
 	enum ReplyStatus : uint8_t
 	{
@@ -40,8 +45,8 @@ namespace
 	SweaBleTransport *g_owner = nullptr;
 	uint8_t g_bootCount = 0;
 
-	void put16(uint8_t *p, uint16_t v) { p[0] = v & 0xFF; p[1] = v >> 8; }
-	void put32(uint8_t *p, uint32_t v) { p[0] = v & 0xFF; p[1] = (v >> 8) & 0xFF; p[2] = (v >> 16) & 0xFF; p[3] = v >> 24; }
+	using swea::put16;
+	using swea::put32;
 
 	class ServerCallbacks : public NimBLEServerCallbacks
 	{
@@ -80,8 +85,17 @@ namespace
 		}
 	};
 
+	class DataCallbacks : public NimBLECharacteristicCallbacks
+	{
+		void onSubscribe(NimBLECharacteristic *c, ble_gap_conn_desc *desc, uint16_t subValue) override
+		{
+			if (g_owner) g_owner->onSubscribe(subValue & 1);	// bit 0 = notifications enabled
+		}
+	};
+
 	ServerCallbacks g_serverCb;
 	ControlCallbacks g_controlCb;
+	DataCallbacks g_dataCb;
 }
 
 // ---------------------------------------------------------------------------------------
@@ -107,20 +121,7 @@ int8_t SweaBleTransport::update(String &, uint16_t &)
 	if (!_on) return 0;
 	uint32_t now = millis();
 
-	// Phase 2 test frame: one debug record per second while a bonded phone has started the stream.
-	if (_streaming && _connected && _encrypted && now - _lastTestFrameMs >= 1000)
-	{
-		_lastTestFrameMs = now;
-		uint8_t buf[3 + 2 + 1 + 4 + 4];
-		buf[0] = PROTOCOL_VERSION;
-		put16(&buf[1], _seq++);
-		buf[3] = 'D'; buf[4] = 'B';
-		buf[5] = 1;
-		put32(&buf[6], now);
-		float v = (float)_seq;
-		memcpy(&buf[10], &v, 4);
-		notifyData(buf, sizeof(buf));
-	}
+	drain();
 	if (_connected && now - _lastStatusMs >= 1000)
 	{
 		_lastStatusMs = now;
@@ -131,10 +132,55 @@ int8_t SweaBleTransport::update(String &, uint16_t &)
 
 uint8_t SweaBleTransport::readControl(String &) { return 0; }	// control opcodes are handled in onControlWrite()
 
-int8_t SweaBleTransport::sendData(const String &)
+// Receives exactly the text packets that EmotiBit also writes to the SD card (one or more lines).
+int8_t SweaBleTransport::sendData(const String &message)
 {
-	// Phase 3: convert the text packets into binary records and queue them here.
+	if (!_on || !_ringMem) return 0;
+	const char *s = message.c_str();
+	size_t len = message.length(), i = 0;
+	while (i < len)
+	{
+		size_t j = i;
+		while (j < len && s[j] != '\n') j++;
+		size_t l = j - i;
+		if (l > 0 && s[i + l - 1] == '\r') l--;
+		if (l > 0) handleLine(s + i, l);
+		i = j + 1;
+	}
 	return 0;
+}
+
+void SweaBleTransport::handleLine(const char *s, size_t len)
+{
+	if (!swea::parsePacketLine(s, len, _pp)) return;
+	if (_pp.tag[0] == 'B' && _pp.tag[1] == '%')
+	{
+		float pct = _pp.v[_pp.n - 1];
+		_batteryPct = pct < 0 ? 0 : (pct > 100 ? 100 : (uint8_t)(pct + 0.5f));
+	}
+	if (swea::profileAllows(_profile, _pp.tag)) _ring.push(_pp.tag, _pp.n, _pp.t_ms, _pp.v);
+}
+
+// Sends queued records as notifications while a bonded phone is subscribed. A few frames per call keep the main loop short.
+void SweaBleTransport::drain()
+{
+	if (!_streaming || !_connected || !_encrypted || !_dataSubscribed) return;
+	size_t cap = _mtu > 3 ? (size_t)_mtu - 3 : 20;
+	if (cap > 244) cap = 244;
+	uint8_t buf[244];
+	for (int frame = 0; frame < 6; frame++)
+	{
+		swea::RecordRing::Cursor c = _ring.cursor();
+		size_t n = swea::buildNotification(_ring, _seq, buf, cap);
+		if (n == 0) break;
+		if (!notifyData(buf, n))
+		{
+			_ring.restore(c);		// not sent: keep the records and try again later
+			_notifyFailures++;
+			break;
+		}
+		_seq++;
+	}
 }
 
 int8_t SweaBleTransport::addCredential(const String &, const String &, const String &, const String &) { return 0; }
@@ -152,6 +198,13 @@ void SweaBleTransport::startBle()
 {
 	g_owner = this;
 	g_bootCount++;
+	if (!_ringMem)
+	{
+		size_t bytes = SWEA_BLE_RING_BYTES;
+		while (bytes >= 4096 && !(_ringMem = (uint8_t *)malloc(bytes))) bytes /= 2;	// shrink if the heap is tight
+		if (_ringMem) _ring.init(_ringMem, bytes);
+		else Serial.println("WARNING: no memory for the BLE record ring; data is not forwarded");
+	}
 	String suffix = _deviceId.length() >= 4 ? _deviceId.substring(_deviceId.length() - 4) : String("0000");
 	String name = "EmotiBit-" + suffix;
 
@@ -166,6 +219,7 @@ void SweaBleTransport::startBle()
 	NimBLEService *svc = g_server->createService(SERVICE_UUID);
 
 	g_data = svc->createCharacteristic(DATA_UUID, NIMBLE_PROPERTY::NOTIFY);
+	g_data->setCallbacks(&g_dataCb);
 	g_control = svc->createCharacteristic(CONTROL_UUID,
 		NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_ENC | NIMBLE_PROPERTY::WRITE_AUTHEN | NIMBLE_PROPERTY::NOTIFY);
 	g_control->setCallbacks(&g_controlCb);
@@ -192,15 +246,19 @@ void SweaBleTransport::stopBle()
 	_on = false;
 	_connected = _encrypted = _streaming = false;
 	NimBLEDevice::deinit(true);
+	if (_ringMem) { free(_ringMem); _ringMem = nullptr; }
 	g_server = nullptr; g_data = g_control = g_status = nullptr;
 }
 
-void SweaBleTransport::notifyData(const uint8_t *buf, size_t len)
+bool SweaBleTransport::notifyData(const uint8_t *buf, size_t len)
 {
-	if (!g_data || !_connected || !_encrypted) return;
-	if (len > (size_t)(_mtu - 3)) { _dropped++; return; }
-	g_data->setValue(buf, len);
-	g_data->notify();
+	if (!g_data || !_connected || !_encrypted) return false;
+	if (len > (size_t)(_mtu - 3)) return false;
+	// NimBLE-Arduino 1.4.3 notify() returns nothing, so call the host API directly: it reports
+	// back-pressure (out of mbufs) as an error and the caller keeps the records for the next try.
+	os_mbuf *om = ble_hs_mbuf_from_flat(buf, len);
+	if (!om) return false;
+	return ble_gattc_notify_custom(_connHandle, g_data->getHandle(), om) == 0;	// takes ownership of om
 }
 
 void SweaBleTransport::sendStatus(bool notify)
@@ -209,13 +267,13 @@ void SweaBleTransport::sendStatus(bool notify)
 	uint8_t s[20] = {0};
 	s[0] = PROTOCOL_VERSION;
 	s[1] = !_on ? 0 : (_streaming ? 3 : (_connected ? 2 : 1));
-	s[2] = 0;								// flags: recording/SD/gap/low battery/pairing are filled in Phase 3/4
-	s[3] = 0xFF;							// battery percent: unknown in Phase 2
-	s[4] = 0;								// profile
+	s[2] = (_batteryPct != 0xFF && _batteryPct < 20) ? 0x08 : 0;	// bit3 low battery; recording/SD/gap/pairing flags come in Phase 4
+	s[3] = _batteryPct;						// 0xFF = unknown
+	s[4] = _profile;
 	s[5] = g_bootCount;
 	put16(&s[6], _seq);
 	put16(&s[8], 0);						// oldest_seq: no ring buffer yet
-	put16(&s[10], (uint16_t)_dropped);
+	put16(&s[10], (uint16_t)_ring.dropped());
 	put32(&s[12], millis());
 	put16(&s[16], (uint16_t)(ESP.getFreeHeap() / 1024));
 	g_status->setValue(s, sizeof(s));
@@ -235,10 +293,11 @@ void SweaBleTransport::sendControlReply(uint8_t opcode, uint8_t status, const ui
 }
 
 // ---- BLE callbacks -------------------------------------------------------------------
-void SweaBleTransport::onConnected(uint16_t connHandle) { _connHandle = connHandle; _connected = true; _encrypted = false; _mtu = 23; }
-void SweaBleTransport::onDisconnected() { _connected = false; _encrypted = false; _streaming = false; _connHandle = 0xFFFF; }
+void SweaBleTransport::onConnected(uint16_t connHandle) { _connHandle = connHandle; _connected = true; _encrypted = false; _dataSubscribed = false; _mtu = 23; }
+void SweaBleTransport::onDisconnected() { _connected = false; _encrypted = false; _streaming = false; _dataSubscribed = false; _connHandle = 0xFFFF; }
 void SweaBleTransport::onEncryptionChange(bool encrypted) { _encrypted = encrypted; }
 void SweaBleTransport::onMtu(uint16_t mtu) { _mtu = mtu; }
+void SweaBleTransport::onSubscribe(bool subscribed) { _dataSubscribed = subscribed; }
 
 void SweaBleTransport::onControlWrite(const uint8_t *data, size_t len)
 {
@@ -263,7 +322,8 @@ void SweaBleTransport::onControlWrite(const uint8_t *data, size_t len)
 		break;
 	}
 	case OP_START_STREAM:
-		if (len != 2) { sendControlReply(op, ST_BAD_ARGS, nullptr, 0); break; }
+		if (len != 2 || data[1] > 2) { sendControlReply(op, ST_BAD_ARGS, nullptr, 0); break; }
+		_profile = data[1];
 		_streaming = true;
 		sendControlReply(op, ST_OK, nullptr, 0);
 		break;
@@ -280,6 +340,11 @@ void SweaBleTransport::onControlWrite(const uint8_t *data, size_t len)
 		sendControlReply(op, ST_OK, out, sizeof(out));
 		break;
 	}
+	case OP_SET_PROFILE:
+		if (len != 2 || data[1] > 2) { sendControlReply(op, ST_BAD_ARGS, nullptr, 0); break; }
+		_profile = data[1];
+		sendControlReply(op, ST_OK, nullptr, 0);
+		break;
 	default:
 		sendControlReply(op, ST_UNSUPPORTED, nullptr, 0);
 	}

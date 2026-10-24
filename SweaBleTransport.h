@@ -14,6 +14,7 @@
 #ifdef SWEA_BLE
 
 #include <Arduino.h>
+#include "SweaBleCodec.h"
 
 // EmotiBit.cpp compares status() against the Arduino Wi-Fi constant. No Wi-Fi header is
 // included in this build, so provide the one value that is used.
@@ -55,6 +56,7 @@ public:
 	void onDisconnected();
 	void onEncryptionChange(bool encrypted);
 	void onMtu(uint16_t mtu);
+	void onSubscribe(bool subscribed);
 	void onControlWrite(const uint8_t *data, size_t len);
 
 private:
@@ -65,14 +67,22 @@ private:
 	volatile bool _streaming = false;
 	volatile uint16_t _mtu = 23;
 	volatile uint16_t _connHandle = 0xFFFF;
+	volatile bool _dataSubscribed = false;
 	uint16_t _seq = 0;
-	uint32_t _lastTestFrameMs = 0;
 	uint32_t _lastStatusMs = 0;
-	uint32_t _dropped = 0;
+	uint8_t _profile = 0;
+	uint8_t _batteryPct = 0xFF;			// 0xFF = unknown until a B% record has been seen
+	swea::RecordRing _ring;
+	uint8_t *_ringMem = nullptr;
+	swea::ParsedPacket _pp;
+	uint32_t _notifyFailures = 0;
+
+	void handleLine(const char *s, size_t len);
+	void drain();
 
 	void startBle();
 	void stopBle();
-	void notifyData(const uint8_t *buf, size_t len);
+	bool notifyData(const uint8_t *buf, size_t len);
 	void sendStatus(bool notify);
 	void sendControlReply(uint8_t opcode, uint8_t status, const uint8_t *args, size_t n);
 };

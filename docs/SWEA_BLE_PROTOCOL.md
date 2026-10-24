@@ -36,7 +36,8 @@ Record       := tag:char[2]  n:u8  t_ms:u32  value:f32[n]
 Gap detection: if `seq` is not previous+1 (mod 65536) the app has missed notifications (only possible around disconnects or buffer overrun). It then issues `RESUME_FROM` (section 4).
 
 ## 3. Ring buffer and reliability
-- The device keeps the last N notifications (configurable, default ≈ 5 minutes worth) in RAM, tagged by `seq`. Longer history exists only on the SD card (CSV), which is never modified by this protocol.
+- The device keeps the newest **records** in a RAM ring (default 24 KB, `SWEA_BLE_RING_BYTES`; roughly 20 s at the full profile, 1–2 kB/s). When it is full the oldest records are dropped and counted in `Status.dropped`. Notifications are built from the ring at send time. Longer history exists only on the SD card (CSV), which is never modified by this protocol.
+- A notification is only sent when a bonded phone has subscribed to `Data`; if the BLE stack reports back-pressure the records stay in the ring and are retried. Replay by `seq` (`RESUME_FROM`) needs a window of already-sent notifications and arrives with Phase 4.
 - The app acknowledges progress with `ACK(seq)` at least every 5 s while streaming; the device frees ring slots up to `seq`.
 - After reconnecting the app sends `RESUME_FROM(last_seq+1)`. The device replays from that sequence if still in RAM, then continues live data. If it is no longer in RAM, `Status.oldest_seq` shows what is available and `Status.flags.gap` is set; the missing part must be retrieved from the SD card later (FTP/USB), and the app marks the gap in its data.
 - If the phone is absent the device keeps recording to the SD card and keeps sampling; BLE is optional for acquisition.
@@ -48,12 +49,12 @@ Write: `opcode:u8, args...`. The device answers by notifying `0x80 | opcode, sta
 | Opcode | Name | Args | Reply args |
 |---|---|---|---|
 | 0x01 | `GET_INFO` | – | `proto:u8, fw:string`, device id as ASCII, nul-terminated |
-| 0x02 | `START_STREAM` | `profile:u8` | – (data notifications start) |
+| 0x02 | `START_STREAM` | `profile:u8` (0..2) | – (data notifications start once `Data` is subscribed) |
 | 0x03 | `STOP_STREAM` | – | – |
 | 0x04 | `TIME_SYNC` | `id:u8` | `id:u8, device_ms:u32` taken when the write is handled |
 | 0x05 | `RESUME_FROM` | `seq:u16` | `first_replayed_seq:u16, flags:u8` |
 | 0x06 | `ACK` | `seq:u16` | – (no reply needed; reply suppressed) |
-| 0x07 | `SET_PROFILE` | `profile:u8` | – |
+| 0x07 | `SET_PROFILE` | `profile:u8` (0..2) | – (implemented in firmware 0.2) |
 | 0x08 | `MARK_EVENT` | `code:u8` | `device_ms:u32` (also emitted as `UN` record) |
 | 0x09 | `RECORD` | `on:u8` | – (equivalent to EmotiBit `RB`/`RE` on the SD card) |
 | 0x0A | `ENTER_PAIRING` | `seconds:u8` | – (only accepted while bonded; button also opens pairing) |
