@@ -110,8 +110,10 @@ uint8_t EmotiBit::setup(String firmwareVariant)
 #endif
 
 #ifdef ARDUINO_FEATHER_ESP32
+#ifndef SWEA_BLE // SWEA: the BLE build needs the Bluetooth controller (NimBLE initialises it)
 	esp_bt_controller_disable();
 	// ToDo: assess similarity with btStop();
+#endif
 	setCpuFrequencyMhz(CPU_HZ / 1000000); // 80MHz has been tested working to save battery life
 #endif
 
@@ -4575,7 +4577,11 @@ String EmotiBit::getFeatherMacAddress()
 	String out;
 	out.reserve(len * 5 + 1); // ToDo: Assess if capacity requires space for \0
 	uint8_t mac[len];
+#ifdef SWEA_BLE
+	esp_read_mac(mac, ESP_MAC_WIFI_STA); // SWEA: same value as WiFi.macAddress(), without starting Wi-Fi
+#else
 	WiFi.macAddress(mac);
+#endif
 	for (uint8_t i = len; i > 0; i--)
 	{
 		//Serial.println(mac[i - 1]);
@@ -4672,6 +4678,7 @@ void EmotiBit::printEmotiBitInfo()
 	Serial.println("\",");
 #endif
 
+#ifndef SWEA_BLE // SWEA: no IP address without Wi-Fi
   if (_emotiBitWiFi.status() == WL_CONNECTED)
   {
     IPAddress ip = WiFi.localIP();
@@ -4679,6 +4686,7 @@ void EmotiBit::printEmotiBitInfo()
     Serial.print(ip);
     Serial.println("\"");
   }
+#endif
   
 	Serial.println("}}]");
 }
