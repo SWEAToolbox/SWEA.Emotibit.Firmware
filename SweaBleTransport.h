@@ -94,6 +94,11 @@ private:
 	bool _gap = false;					// last RESUME_FROM asked for frames that were no longer held
 	swea::ParsedPacket _pp;
 	uint32_t _notifyFailures = 0;
+	bool _recording = false;				// as commanded over BLE (RECORD); the SD card state is owned by EmotiBit
+	static const uint8_t CTRL_OUT = 4;
+	String _ctrlOut[CTRL_OUT];			// text control packets that EmotiBit's own parser consumes via readControl()
+	uint8_t _ctrlHead = 0, _ctrlTail = 0;
+	bool pushControlPacket(const String &packet);
 
 	Command _cmds[CMD_QUEUE];
 	volatile uint8_t _cmdHead = 0, _cmdTail = 0;

@@ -55,11 +55,11 @@ Write: `opcode:u8, args...`. The device answers by notifying `0x80 | opcode, sta
 | 0x05 | `RESUME_FROM` | `seq:u16` | `first_replayed_seq:u16, flags:u8` |
 | 0x06 | `ACK` | `seq:u16` | – (no reply needed; reply suppressed) |
 | 0x07 | `SET_PROFILE` | `profile:u8` (0..2) | – (implemented in firmware 0.2) |
-| 0x08 | `MARK_EVENT` | `code:u8` | `device_ms:u32` (also emitted as `UN` record) |
-| 0x09 | `RECORD` | `on:u8` | – (equivalent to EmotiBit `RB`/`RE` on the SD card) |
+| 0x08 | `MARK_EVENT` | `code:u8` | `device_ms:u32`. The marker is written to the SD card as a `UN` packet and comes back in the data stream as a `UN` record with the code as its value (implemented in firmware 0.4) |
+| 0x09 | `RECORD` | off: `0`. on: `1, utc_seconds:u32, milliseconds:u16` | – . Starts/stops SD recording exactly like the Oscilloscope's `RB`/`RE` packets; the files are named `YYYY-MM-DD_HH-MM-SS-mmm.csv` (UTC) from the time given. A time before 2020 is refused (status 1). Implemented in firmware 0.4; `Status.flags` bit0 reports the commanded state |
 | 0x0A | `ENTER_PAIRING` | `seconds:u8` | – (only accepted while bonded; button also opens pairing) |
 | 0x0B | `CLEAR_BONDS` | – | – |
-| 0x0C | `SLEEP` | – | – |
+| 0x0C | `SLEEP` | – | – . Sends EmotiBit's own hibernate packet (`MH`); the board flushes the SD card and powers down. Implemented in firmware 0.4 |
 
 Profiles (initial): `0` = all channels, `1` = EDA + temperature + motion only (no PPG/MAG, lowest power), `2` = all channels with 100 Hz PPG (only on the 100 Hz firmware build).
 

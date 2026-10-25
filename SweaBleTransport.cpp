@@ -4,10 +4,11 @@
 
 #include <NimBLEDevice.h>
 #include <Preferences.h>
+#include <time.h>
 
 // Optional fixed passkey for development builds (-DSWEA_BLE_PASSKEY=123456). Without it every device
 // generates its own random 6-digit passkey on first boot and keeps it in NVS (see loadPasskey()).
-#define SWEA_BLE_FW_STRING "swea-ble-0.3"
+#define SWEA_BLE_FW_STRING "swea-ble-0.4"
 // RAM for the record ring (newest data is kept when it is full; the SD card keeps everything).
 #ifndef SWEA_BLE_RING_BYTES
 #define SWEA_BLE_RING_BYTES 24576
@@ -36,8 +37,11 @@ namespace
 		OP_RESUME_FROM = 0x05,
 		OP_ACK = 0x06,
 		OP_SET_PROFILE = 0x07,
+		OP_MARK_EVENT = 0x08,
+		OP_RECORD = 0x09,
 		OP_ENTER_PAIRING = 0x0A,
-		OP_CLEAR_BONDS = 0x0B
+		OP_CLEAR_BONDS = 0x0B,
+		OP_SLEEP = 0x0C
 	};
 	enum ReplyStatus : uint8_t
 	{
@@ -175,7 +179,25 @@ int8_t SweaBleTransport::update(String &, uint16_t &)
 	return 0;
 }
 
-uint8_t SweaBleTransport::readControl(String &) { return 0; }	// control opcodes are handled in processCommands()
+// EmotiBit's own control parser (parseIncomingControlPackets) reads text packets here. Commands that map onto EmotiBit
+// features (recording, event markers, sleep) are turned into the same packets the Oscilloscope would send.
+uint8_t SweaBleTransport::readControl(String &packet)
+{
+	if (_ctrlTail == _ctrlHead) return 0;
+	packet = _ctrlOut[_ctrlTail];
+	_ctrlOut[_ctrlTail] = "";
+	_ctrlTail = (_ctrlTail + 1) % CTRL_OUT;
+	return packet.length() > 255 ? 255 : (uint8_t)packet.length();
+}
+
+bool SweaBleTransport::pushControlPacket(const String &packet)
+{
+	uint8_t next = (_ctrlHead + 1) % CTRL_OUT;
+	if (next == _ctrlTail) return false;	// queue full
+	_ctrlOut[_ctrlHead] = packet;
+	_ctrlHead = next;
+	return true;
+}
 
 // Receives exactly the text packets that EmotiBit also writes to the SD card (one or more lines).
 int8_t SweaBleTransport::sendData(const String &message)
@@ -316,6 +338,7 @@ void SweaBleTransport::startBle()
 	}
 	_replay = false; _gap = false;
 	_cmdHead = _cmdTail = 0;
+	_ctrlHead = _ctrlTail = 0; _recording = false;
 	loadPasskey();
 
 	String suffix = _deviceId.length() >= 4 ? _deviceId.substring(_deviceId.length() - 4) : String("0000");
@@ -385,8 +408,8 @@ void SweaBleTransport::sendStatus(bool notify)
 	s[0] = PROTOCOL_VERSION;
 	s[1] = !_on ? 0 : (_streaming ? 3 : (_connected ? 2 : 1));
 	// flags: bit1 SD ok (the firmware does not start without a card), bit2 gap, bit3 low battery, bit4 pairing open.
-	// bit0 recording is not reported yet.
-	s[2] = 0x02 | (_gap ? 0x04 : 0) | ((_batteryPct != 0xFF && _batteryPct < 20) ? 0x08 : 0) | (_pairingOpen ? 0x10 : 0);
+	// bit0 recording: as commanded over BLE.
+	s[2] = 0x02 | (_recording ? 0x01 : 0) | (_gap ? 0x04 : 0) | ((_batteryPct != 0xFF && _batteryPct < 20) ? 0x08 : 0) | (_pairingOpen ? 0x10 : 0);
 	s[3] = _batteryPct;						// 0xFF = unknown
 	s[4] = _profile;
 	s[5] = g_bootCount;
@@ -520,6 +543,45 @@ void SweaBleTransport::execute(const Command &c)
 	case OP_SET_PROFILE:
 		if (len != 2 || data[1] > 2) { sendControlReply(op, ST_BAD_ARGS, nullptr, 0); break; }
 		_profile = data[1];
+		sendControlReply(op, ST_OK, nullptr, 0);
+		break;
+	case OP_MARK_EVENT:
+	{
+		// A UN packet through EmotiBit's control path is logged on the SD card with a packet number and comes back
+		// through sendData(), so the event reaches the phone in the data stream too. Reply: the device clock.
+		if (len != 2) { sendControlReply(op, ST_BAD_ARGS, nullptr, 0); break; }
+		if (!pushControlPacket("0,0,1,UN,1,100," + String((unsigned)data[1]))) { sendControlReply(op, ST_BUSY, nullptr, 0); break; }
+		uint8_t out[4];
+		put32(out, millis());
+		sendControlReply(op, ST_OK, out, sizeof(out));
+		break;
+	}
+	case OP_RECORD:
+	{
+		// off: 09 00      on: 09 01 <utc seconds u32> <milliseconds u16>   (names the files like the Oscilloscope: YYYY-MM-DD_HH-MM-SS-mmm)
+		if (len == 2 && data[1] == 0)
+		{
+			if (!pushControlPacket("0,0,0,RE,1,100")) { sendControlReply(op, ST_BUSY, nullptr, 0); break; }
+			_recording = false;
+			sendControlReply(op, ST_OK, nullptr, 0);
+			break;
+		}
+		if (len != 8 || data[1] != 1) { sendControlReply(op, ST_BAD_ARGS, nullptr, 0); break; }
+		time_t t = (time_t)swea::get32(&data[2]);
+		uint16_t ms = get16(&data[6]);
+		struct tm tmv;
+		gmtime_r(&t, &tmv);
+		if (tmv.tm_year + 1900 < 2020 || ms > 999) { sendControlReply(op, ST_BAD_ARGS, nullptr, 0); break; }	// a phone with a wrong clock would name files 1970
+		char name[32];
+		snprintf(name, sizeof(name), "%04d-%02d-%02d_%02d-%02d-%02d-%03u", tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday, tmv.tm_hour, tmv.tm_min, tmv.tm_sec, (unsigned)ms);
+		if (!pushControlPacket(String("0,0,1,RB,1,100,") + name)) { sendControlReply(op, ST_BUSY, nullptr, 0); break; }
+		_recording = true;
+		sendControlReply(op, ST_OK, nullptr, 0);
+		break;
+	}
+	case OP_SLEEP:
+		// MH = hibernate, the same packet the Oscilloscope sends. EmotiBit flushes the SD card and powers down in update().
+		if (!pushControlPacket("0,0,0,MH,1,100")) { sendControlReply(op, ST_BUSY, nullptr, 0); break; }
 		sendControlReply(op, ST_OK, nullptr, 0);
 		break;
 	case OP_ENTER_PAIRING:

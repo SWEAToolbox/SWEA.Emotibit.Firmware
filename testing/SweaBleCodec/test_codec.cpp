@@ -37,6 +37,8 @@ int main()
 		CHECK(parse("531459,17302,2,EL,1,100,26425.000000,26425.000000", p) && p.v[0] == 26425.0f);
 		CHECK(parse("1000,1,1,B%,1,100,87", p) && p.v[0] == 87.0f);
 		CHECK(parse("1000,1,3,AX,1,100,-0.436,0.1,-9.8", p) && p.v[0] < -0.43f && p.v[2] < -9.7f);
+		CHECK(parse("2000,3,1,UN,1,100,7", p) && p.n == 1 && p.v[0] == 7.0f);	// event marker with a numeric code
+		CHECK(!parse("2000,3,1,UN,1,100,hello", p));	// free-text user notes are not forwarded
 		CHECK(!parse("531473,5,1,EM,1,100,MN", p));		// mode packet, not a data tag
 		CHECK(!parse("531473,5,1,AK,1,100,12", p));		// control
 		CHECK(!parse("abc,1,1,EA,1,100,1", p));			// bad timestamp

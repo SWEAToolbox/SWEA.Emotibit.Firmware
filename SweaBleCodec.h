@@ -34,7 +34,7 @@ namespace swea
 		static const char *const tags[] = {
 			"EA","EL","ER","PI","PR","PG","O2","T0","T1","TH","H0",
 			"AX","AY","AZ","GX","GY","GZ","MX","MY","MZ",
-			"BV","B%","SD","HR","BI","SA","SR","SF","DC","DO" };
+			"BV","B%","SD","HR","BI","SA","SR","SF","DC","DO","UN" };
 		for (size_t i = 0; i < sizeof(tags) / sizeof(tags[0]); i++)
 			if (t[0] == tags[i][0] && t[1] == tags[i][1]) return true;
 		return false;
