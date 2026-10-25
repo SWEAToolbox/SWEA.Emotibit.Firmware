@@ -8,7 +8,7 @@
 
 // Optional fixed passkey for development builds (-DSWEA_BLE_PASSKEY=123456). Without it every device
 // generates its own random 6-digit passkey on first boot and keeps it in NVS (see loadPasskey()).
-#define SWEA_BLE_FW_STRING "swea-ble-0.6"
+#define SWEA_BLE_FW_STRING "swea-ble-0.7"
 // Longest Control notification (opcode, status and arguments). Needs an MTU above 23, which the phone always asks for.
 #define CONTROL_REPLY_MAX 64
 // RAM for the record ring (newest data is kept when it is full; the SD card keeps everything).
@@ -66,11 +66,16 @@ namespace
 	using swea::put16;
 	using swea::put32;
 
-	// Connection parameters (protocol doc, section 1): interval 100-200 ms, latency 4, supervision timeout 6 s.
-	const uint16_t CONN_MIN_INTERVAL = 80;	// units of 1.25 ms
-	const uint16_t CONN_MAX_INTERVAL = 160;
-	const uint16_t CONN_LATENCY = 4;
-	const uint16_t CONN_TIMEOUT = 600;		// units of 10 ms
+	// Connection parameters (protocol doc, section 1): interval 30-50 ms, no latency, supervision timeout 4 s.
+	// A phone follows these (Windows did not): at 100-200 ms with latency 4 an Android phone carried only about
+	// 2.5 notifications/s, less than the full profile produces, and the backlog starved the Control channel.
+	const uint16_t CONN_MIN_INTERVAL = 24;	// units of 1.25 ms
+	const uint16_t CONN_MAX_INTERVAL = 40;
+	const uint16_t CONN_LATENCY = 0;
+	const uint16_t CONN_TIMEOUT = 400;		// units of 10 ms
+	// At most one data notification per this many ms (about 10 kB/s at full MTU, five times the full profile), so NimBLE's
+	// buffers never fill up and Control replies and writes still get through.
+	const uint32_t NOTIFY_SPACING_MS = 25;
 
 	class ServerCallbacks : public NimBLEServerCallbacks
 	{
@@ -243,11 +248,13 @@ void SweaBleTransport::drain()
 	{
 		for (int frame = 0; frame < 6 && _replay; frame++)
 		{
+			if (millis() - _lastNotifyMs < NOTIFY_SPACING_MS) break;
 			if (!swea::seqBefore(_replaySeq, _replayEnd)) { _replay = false; break; }
 			size_t l = 0;
 			if (_win.get(_replaySeq, buf, l))
 			{
 				if (!notifyData(buf, l)) { _notifyFailures++; return; }	// retry the same frame next time
+				_lastNotifyMs = millis();
 			}
 			else _gap = true;											// fell out of the window while replaying
 			_replaySeq++;
@@ -257,6 +264,7 @@ void SweaBleTransport::drain()
 
 	for (int frame = 0; frame < 6; frame++)
 	{
+		if (millis() - _lastNotifyMs < NOTIFY_SPACING_MS) break;
 		swea::RecordRing::Cursor c = _ring.cursor();
 		size_t n = swea::buildNotification(_ring, _seq, buf, cap, _profile);
 		if (n == 0) break;
@@ -268,6 +276,7 @@ void SweaBleTransport::drain()
 		}
 		_win.store(_seq, buf, n);
 		_seq++;
+		_lastNotifyMs = millis();
 	}
 }
 

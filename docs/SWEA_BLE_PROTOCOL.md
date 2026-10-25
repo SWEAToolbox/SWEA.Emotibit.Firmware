@@ -18,7 +18,7 @@ Design rules
 | Device Information | `0x180A` | read | manufacturer, model, firmware revision, serial |
 | Battery | `0x180F` / `0x2A19` | read, notify | percent |
 
-Connection: central requests MTU 247 (usable notification payload = MTU − 3; fall back to 20 bytes at MTU 23). Preferred connection interval 100–200 ms, slave latency up to 4, supervision timeout 6 s. Device batches ≈ 100–500 ms of data per notification burst.
+Connection: central requests MTU 247 (usable notification payload = MTU − 3; fall back to 20 bytes at MTU 23). Preferred connection interval 30–50 ms, no slave latency, supervision timeout 4 s (firmware 0.7; 100–200 ms with latency 4 was too slow on an Android phone for the full profile). The device sends at most one data notification per 25 ms, so Control traffic always gets through.
 
 ## 2. Data notifications
 
