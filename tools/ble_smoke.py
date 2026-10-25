@@ -15,7 +15,7 @@ CONTROL = "1118282f-3dfe-44a7-a12f-6d06987f1092"
 STATUS = "8c2502e8-eacd-45d1-bd20-361eb5a762a2"
 
 
-async def main(paired: bool) -> int:
+async def main(paired: bool, open_pairing: int = 0) -> int:
     found = await BleakScanner.discover(timeout=8, service_uuids=[SERVICE], return_adv=True)
     if not found:
         print("FAIL: no device advertises the SWEA service")
@@ -52,7 +52,23 @@ async def main(paired: bool) -> int:
                 print(f"PASS: unencrypted read refused ({type(e).__name__}: {e})")
         if paired and ok:
             ok &= await check_get_info(client)
+        if paired and ok and open_pairing:
+            ok &= await send_open_pairing(client, open_pairing)
     return 0 if ok else 1
+
+
+async def send_open_pairing(client, seconds: int) -> bool:
+    """ENTER_PAIRING (0x0A): let another phone pair for `seconds`. Only accepted over a bonded link."""
+    replies: asyncio.Queue = asyncio.Queue()
+    await client.start_notify(CONTROL, lambda _h, d: replies.put_nowait(bytes(d)))
+    try:
+        await client.write_gatt_char(CONTROL, bytes([0x0A, min(seconds, 255)]), response=True)
+        reply = await asyncio.wait_for(replies.get(), timeout=5)
+    finally:
+        await client.stop_notify(CONTROL)
+    ok = len(reply) >= 2 and reply[0] == 0x8A and reply[1] == 0
+    print(("PASS" if ok else "FAIL") + f": ENTER_PAIRING {seconds} s, reply {reply.hex()}")
+    return ok
 
 
 async def check_get_info(client) -> bool:
@@ -80,4 +96,7 @@ async def check_get_info(client) -> bool:
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--paired", action="store_true")
-    sys.exit(asyncio.run(main(ap.parse_args().paired)))
+    ap.add_argument("--open-pairing", type=int, default=0, metavar="SECONDS",
+                    help="after the checks, open the pairing window so a phone can pair (needs --paired)")
+    args = ap.parse_args()
+    sys.exit(asyncio.run(main(args.paired, args.open_pairing)))
