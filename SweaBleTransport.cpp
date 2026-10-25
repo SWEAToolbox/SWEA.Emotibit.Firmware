@@ -8,7 +8,7 @@
 
 // Optional fixed passkey for development builds (-DSWEA_BLE_PASSKEY=123456). Without it every device
 // generates its own random 6-digit passkey on first boot and keeps it in NVS (see loadPasskey()).
-#define SWEA_BLE_FW_STRING "swea-ble-0.7"
+#define SWEA_BLE_FW_STRING "swea-ble-0.8"
 // Longest Control notification (opcode, status and arguments). Needs an MTU above 23, which the phone always asks for.
 #define CONTROL_REPLY_MAX 64
 // RAM for the record ring (newest data is kept when it is full; the SD card keeps everything).
@@ -328,6 +328,9 @@ void SweaBleTransport::loadPasskey()
 	_passkey = pk;
 #endif
 	g_passkey = _passkey;
+	// USB serial only (physical access): `emotibit.py label` reads it to print the QR label. `emotibit.py monitor` hides it.
+	Serial.print("SWEA BLE label: id "); Serial.print(_deviceId.length() ? _deviceId : String("?"));
+	Serial.print(" passkey "); Serial.println(_passkey);
 }
 
 void SweaBleTransport::startBle()

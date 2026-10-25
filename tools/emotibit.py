@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""SWEA EmotiBit tool: check, ports, backup, build, flash, restore, monitor, scan.
+"""SWEA EmotiBit tool: check, ports, backup, build, flash, restore, monitor, label, scan.
 
 One cross-platform script (Windows, Linux) around esptool, PlatformIO and pyserial.
 Set up its Python environment first with tools/setup.ps1 (Windows) or tools/setup.sh (Linux), then run it with
@@ -37,7 +37,7 @@ FLASH_SIZE = 0x400000  # Adafruit Feather HUZZAH32: 4 MB
 IS_WINDOWS = platform.system() == "Windows"
 CP210X = (0x10C4, 0xEA60)
 # Stock EmotiBit firmware prints "Adding SSID: x -pass:secret" on Serial.
-REDACT = re.compile(r"(-pass:)\S+")
+REDACT = re.compile(r"(-pass:|[Pp]asskey:? )\d*\S*")
 
 
 def backups_root() -> pathlib.Path:
@@ -293,6 +293,68 @@ def cmd_monitor(args):
     return 0
 
 
+LABEL_LINE = re.compile(r"SWEA BLE label: id (\S+) passkey (\d{6})")
+
+
+def read_label_info(port: str, seconds: int = 25):
+    """Restart the board and read its device id and passkey from the boot log (firmware 0.8+). Nothing is printed."""
+    import serial
+    try:
+        s = serial.Serial(port, 2000000, timeout=0.2)
+    except serial.SerialException as e:
+        sys.exit(f"Cannot open {port}: {e}")
+    s.setDTR(False)
+    s.setRTS(True)
+    time.sleep(0.15)
+    s.setRTS(False)
+    end, buf = time.time() + seconds, b""
+    try:
+        while time.time() < end:
+            buf += s.read(4096)
+            m = LABEL_LINE.search(buf.decode("utf-8", errors="replace"))
+            if m and m.group(1) != "?":
+                return m.group(1), m.group(2)
+    finally:
+        s.close()
+    sys.exit("No 'SWEA BLE label' line in the boot log. Is SWEA BLE firmware 0.8 or later on the board?")
+
+
+def label_svg(qr_svg_body: str, device_id: str) -> str:
+    """A small label: the QR code, the advertised name, the id and how to open pairing. The passkey is only inside the QR."""
+    name = "EmotiBit-" + device_id[-4:]
+    w, h = 300, 140
+    return f"""<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}">
+  <rect width="{w}" height="{h}" fill="#fff" stroke="#111827" stroke-width="1" rx="8"/>
+  {qr_svg_body.replace("<svg ", '<svg x="10" y="10" width="120" height="120" ', 1)}
+  <text x="142" y="40" font-family="Inter,Arial,sans-serif" font-size="18" font-weight="700" fill="#111827">{name}</text>
+  <text x="142" y="62" font-family="Inter,Arial,sans-serif" font-size="12" fill="#4b5563">{device_id}</text>
+  <text x="142" y="92" font-family="Inter,Arial,sans-serif" font-size="11" fill="#4b5563">Skanna i SWEA Toolbox.</text>
+  <text x="142" y="108" font-family="Inter,Arial,sans-serif" font-size="11" fill="#4b5563">Para: tryck kort på knappen,</text>
+  <text x="142" y="122" font-family="Inter,Arial,sans-serif" font-size="11" fill="#4b5563">lampan blinkar i 2 minuter.</text>
+</svg>
+"""
+
+
+def cmd_label(args):
+    """Make the pairing label for a board: a QR code with its id and passkey that SWEA Toolbox scans."""
+    need("serial", "Run tools/setup first.")
+    need("segno", "Run tools/setup again (segno is in requirements.txt).")
+    import io, json, segno
+    device_id, passkey = read_label_info(args.port)
+    payload = json.dumps({"t": "emotibit", "sn": device_id, "pk": passkey}, separators=(",", ":"))
+    qr = segno.make(payload, error="m")
+    out = pathlib.Path(args.out) if args.out else backups_root() / device_id / "label"
+    out.mkdir(parents=True, exist_ok=True)
+    qr.save(out / "qr.png", scale=8, border=2)
+    buf = io.BytesIO()
+    qr.save(buf, kind="svg", xmldecl=False, svgns=False, border=0, omitsize=True)
+    body = buf.getvalue().decode("utf-8")
+    (out / "label.svg").write_text(label_svg(body, device_id), encoding="utf-8")
+    print(f"Label for {device_id} written to {out} (label.svg, qr.png).")
+    print("The QR code contains the passkey: keep these files private (they are not in git) and stick the label on the device.")
+    return 0
+
+
 def cmd_scan(args):
     need("bleak", "Install it with: pip install bleak")
     import asyncio
@@ -349,6 +411,8 @@ def main():
     p.add_argument("--reset", action="store_true", help="restart the board first to see the whole boot log")
     p.add_argument("--raw", action="store_true", help="do not hide passwords")
     p.add_argument("--grep", help="only show lines matching this regex")
+    p = add("label", cmd_label, "make the pairing label: QR code with the device id and passkey (firmware 0.8+)")
+    p.add_argument("--out", help="output folder (default: EmotiBit-backups/<device id>/label)")
     p = add("scan", cmd_scan, "scan for the EmotiBit BLE advertisement", port=False)
     p.add_argument("--seconds", type=int, default=10)
 
