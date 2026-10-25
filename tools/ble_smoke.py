@@ -50,7 +50,31 @@ async def main(paired: bool) -> int:
                 ok = False
             else:
                 print(f"PASS: unencrypted read refused ({type(e).__name__}: {e})")
+        if paired and ok:
+            ok &= await check_get_info(client)
     return 0 if ok else 1
+
+
+async def check_get_info(client) -> bool:
+    """GET_INFO (0x01): the reply 0x81, status 0, then protocol version, firmware\\0, device id\\0 (firmware 0.5+)."""
+    replies: asyncio.Queue = asyncio.Queue()
+    await client.start_notify(CONTROL, lambda _h, d: replies.put_nowait(bytes(d)))
+    try:
+        await client.write_gatt_char(CONTROL, bytes([0x01]), response=True)
+        reply = await asyncio.wait_for(replies.get(), timeout=5)
+    except Exception as e:  # noqa: BLE001
+        print(f"FAIL: GET_INFO got no reply ({type(e).__name__}: {e})")
+        return False
+    finally:
+        await client.stop_notify(CONTROL)
+    if len(reply) < 3 or reply[0] != 0x81 or reply[1] != 0:
+        print(f"FAIL: GET_INFO reply {reply.hex()}")
+        return False
+    strings = reply[3:].split(b"\0")
+    firmware = strings[0].decode("ascii", "replace") if strings else ""
+    device_id = strings[1].decode("ascii", "replace") if len(strings) > 1 else ""
+    print(f"{'PASS' if device_id else 'FAIL'}: GET_INFO protocol {reply[2]}, firmware {firmware!r}, device id {device_id!r}")
+    return bool(device_id)
 
 
 if __name__ == "__main__":
