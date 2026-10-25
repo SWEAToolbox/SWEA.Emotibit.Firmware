@@ -161,6 +161,22 @@ int main()
 		CHECK(seqBefore(65535, 1) && !seqBefore(1, 65535) && !seqBefore(5, 5));
 	}
 
+	{	// GET_INFO reply: proto, firmware\0, device id\0 (the phone registers the device by this id)
+		uint8_t out[64];
+		size_t n = buildInfoReply(out, sizeof(out), 1, "swea-ble-0.5", "MD-V5-0000302");
+		CHECK(n == 1 + 12 + 1 + 13 + 1);
+		CHECK(out[0] == 1);
+		CHECK(strcmp((const char *)&out[1], "swea-ble-0.5") == 0);
+		CHECK(strcmp((const char *)&out[14], "MD-V5-0000302") == 0);
+		CHECK(out[n - 1] == 0);
+		uint8_t small[20];									// a long id is cut, never overflows, stays nul-terminated
+		size_t m = buildInfoReply(small, sizeof(small), 1, "swea-ble-0.5", "ABCDEFGHIJKLMNOP");
+		CHECK(m == sizeof(small) && small[m - 1] == 0);
+		CHECK(strcmp((const char *)&small[1], "swea-ble-0.5") == 0);
+		n = buildInfoReply(out, sizeof(out), 1, "fw", "");	// unknown id: empty string
+		CHECK(n == 1 + 3 + 1 && out[4] == 0);
+	}
+
 	printf("%d checks, %d failed\n", g_checks, g_fail);
 	return g_fail ? 1 : 0;
 }

@@ -265,4 +265,18 @@ namespace swea
 		}
 		return len > NOTIFICATION_HEADER_LEN ? len : 0;
 	}
+
+	// GET_INFO reply arguments: proto:u8, firmware string\0, device id\0. Strings are cut to fit; both stay
+	// nul-terminated. Returns the length written (0 if cap is too small for the version byte and two nuls).
+	inline size_t buildInfoReply(uint8_t *out, size_t cap, uint8_t proto, const char *fw, const char *deviceId)
+	{
+		if (cap < 3) return 0;
+		size_t n = 0;
+		out[n++] = proto;
+		for (size_t i = 0; fw && fw[i] && n < cap - 2; i++) out[n++] = (uint8_t)fw[i];
+		out[n++] = 0;
+		for (size_t i = 0; deviceId && deviceId[i] && n < cap - 1; i++) out[n++] = (uint8_t)deviceId[i];
+		out[n++] = 0;
+		return n;
+	}
 }

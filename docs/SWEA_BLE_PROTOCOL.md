@@ -48,7 +48,7 @@ Write: `opcode:u8, args...`. The device answers by notifying `0x80 | opcode, sta
 
 | Opcode | Name | Args | Reply args |
 |---|---|---|---|
-| 0x01 | `GET_INFO` | – | `proto:u8, fw:string`, device id as ASCII, nul-terminated |
+| 0x01 | `GET_INFO` | – | `proto:u8`, `fw` ASCII nul-terminated, `device_id` ASCII nul-terminated (EmotiBit device id, e.g. `MD-V5-0000302`; the phone registers the device on the server with it). Up to 62 argument bytes, so read it after the MTU exchange. Firmware before 0.5 sent no id |
 | 0x02 | `START_STREAM` | `profile:u8` (0..2) | – (data notifications start once `Data` is subscribed) |
 | 0x03 | `STOP_STREAM` | – | – |
 | 0x04 | `TIME_SYNC` | `id:u8` | `id:u8, device_ms:u32` taken when the write is handled |

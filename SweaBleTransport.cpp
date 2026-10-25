@@ -8,7 +8,9 @@
 
 // Optional fixed passkey for development builds (-DSWEA_BLE_PASSKEY=123456). Without it every device
 // generates its own random 6-digit passkey on first boot and keeps it in NVS (see loadPasskey()).
-#define SWEA_BLE_FW_STRING "swea-ble-0.4"
+#define SWEA_BLE_FW_STRING "swea-ble-0.5"
+// Longest Control notification (opcode, status and arguments). Needs an MTU above 23, which the phone always asks for.
+#define CONTROL_REPLY_MAX 64
 // RAM for the record ring (newest data is kept when it is full; the SD card keeps everything).
 #ifndef SWEA_BLE_RING_BYTES
 #define SWEA_BLE_RING_BYTES 24576
@@ -425,7 +427,7 @@ void SweaBleTransport::sendStatus(bool notify)
 void SweaBleTransport::sendControlReply(uint8_t opcode, uint8_t status, const uint8_t *args, size_t n)
 {
 	if (!g_control || !_connected) return;
-	uint8_t buf[40];
+	uint8_t buf[CONTROL_REPLY_MAX];
 	if (n > sizeof(buf) - 2) n = sizeof(buf) - 2;
 	buf[0] = 0x80 | opcode;
 	buf[1] = status;
@@ -488,12 +490,9 @@ void SweaBleTransport::execute(const Command &c)
 	{
 	case OP_GET_INFO:
 	{
-		uint8_t out[40];
-		size_t n = 0;
-		out[n++] = PROTOCOL_VERSION;
-		const char *fw = SWEA_BLE_FW_STRING;
-		for (size_t i = 0; fw[i] && n < sizeof(out) - 2; i++) out[n++] = fw[i];
-		out[n++] = 0;
+		// The phone registers the device on the server by this id, so it is sent in full.
+		uint8_t out[CONTROL_REPLY_MAX - 2];
+		size_t n = swea::buildInfoReply(out, sizeof(out), PROTOCOL_VERSION, SWEA_BLE_FW_STRING, _deviceId.c_str());
 		sendControlReply(op, ST_OK, out, n);
 		break;
 	}
