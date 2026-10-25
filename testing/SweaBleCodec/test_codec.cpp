@@ -161,6 +161,27 @@ int main()
 		CHECK(seqBefore(65535, 1) && !seqBefore(1, 65535) && !seqBefore(5, 5));
 	}
 
+	{	// Records already in the ring under another profile: profile 1 must not send PPG or magnetometer data
+		static uint8_t mem[2048];
+		RecordRing ring;
+		ring.init(mem, sizeof(mem));
+		float v[2] = {1.0f, 2.0f};
+		ring.push("PI", 2, 100, v);
+		ring.push("EA", 2, 100, v);
+		ring.push("MX", 1, 100, v);
+		ring.push("T1", 1, 100, v);
+		uint8_t out[244];
+		size_t n = buildNotification(ring, 3, out, sizeof(out), 1);
+		CHECK(n == 3 + (7 + 8) + (7 + 4));					// EA (2 values) and T1 (1 value) only
+		CHECK(out[3] == 'E' && out[4] == 'A');
+		CHECK(out[3 + 15] == 'T' && out[3 + 16] == '1');
+		CHECK(ring.empty());								// the skipped records are gone, not left for later
+		ring.push("PG", 1, 200, v);
+		CHECK(buildNotification(ring, 4, out, sizeof(out), 1) == 0 && ring.empty());	// nothing allowed: nothing sent
+		ring.push("PG", 1, 300, v);
+		CHECK(buildNotification(ring, 5, out, sizeof(out)) == 3 + 7 + 4);				// profile 0 (default) sends it
+	}
+
 	{	// GET_INFO reply: proto, firmware\0, device id\0 (the phone registers the device by this id)
 		uint8_t out[64];
 		size_t n = buildInfoReply(out, sizeof(out), 1, "swea-ble-0.5", "MD-V5-0000302");

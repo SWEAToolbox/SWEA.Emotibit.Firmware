@@ -8,7 +8,7 @@
 
 // Optional fixed passkey for development builds (-DSWEA_BLE_PASSKEY=123456). Without it every device
 // generates its own random 6-digit passkey on first boot and keeps it in NVS (see loadPasskey()).
-#define SWEA_BLE_FW_STRING "swea-ble-0.5"
+#define SWEA_BLE_FW_STRING "swea-ble-0.6"
 // Longest Control notification (opcode, status and arguments). Needs an MTU above 23, which the phone always asks for.
 #define CONTROL_REPLY_MAX 64
 // RAM for the record ring (newest data is kept when it is full; the SD card keeps everything).
@@ -258,7 +258,7 @@ void SweaBleTransport::drain()
 	for (int frame = 0; frame < 6; frame++)
 	{
 		swea::RecordRing::Cursor c = _ring.cursor();
-		size_t n = swea::buildNotification(_ring, _seq, buf, cap);
+		size_t n = swea::buildNotification(_ring, _seq, buf, cap, _profile);
 		if (n == 0) break;
 		if (!notifyData(buf, n))
 		{

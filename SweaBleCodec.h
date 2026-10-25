@@ -239,8 +239,10 @@ namespace swea
 	/** Build one data notification from the head of the ring.
 	 *  maxLen is the usable notification payload (ATT_MTU - 3). Returns the length (0 = nothing to send or no room).
 	 *  Records that do not fit entirely are split into several records with the same t_ms.
-	 *  The ring advances; on a failed send call ring.restore(cursor) with a cursor taken before. */
-	inline size_t buildNotification(RecordRing &ring, uint16_t seq, uint8_t *out, size_t maxLen)
+	 *  The ring advances; on a failed send call ring.restore(cursor) with a cursor taken before.
+	 *  Records the stream profile does not allow are dropped here too: the ring keeps filling while nobody streams,
+	 *  so it can hold records from before a profile change. */
+	inline size_t buildNotification(RecordRing &ring, uint16_t seq, uint8_t *out, size_t maxLen, uint8_t profile = 0)
 	{
 		if (maxLen < NOTIFICATION_HEADER_LEN + RECORD_HEADER_LEN + 4) return 0;
 		size_t len = NOTIFICATION_HEADER_LEN;
@@ -249,6 +251,7 @@ namespace swea
 		RecordRing::View r;
 		while (ring.peek(r))
 		{
+			if (ring.partial() == 0 && !profileAllows(profile, r.tag)) { ring.popHead(); continue; }
 			uint8_t sent = ring.partial();
 			size_t remaining = (size_t)r.n - sent;
 			size_t space = maxLen - len;
