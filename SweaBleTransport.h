@@ -51,15 +51,24 @@ public:
 	// ---- SWEA specific ---------------------------------------------------------------
 	bool isStreaming() const { return _streaming; }
 
-	// Called from the BLE callbacks (NimBLE host task)
+	/** Accept pairing with new phones for this many seconds (button press or ENTER_PAIRING). Prints the passkey on Serial. */
+	void openPairing(uint16_t seconds = 120);
+	bool isPairingOpen() const { return _pairingOpen; }
+
+	// Called from the BLE callbacks (NimBLE host task). They only set flags or queue work for update().
 	void onConnected(uint16_t connHandle);
 	void onDisconnected();
 	void onEncryptionChange(bool encrypted);
 	void onMtu(uint16_t mtu);
 	void onSubscribe(bool subscribed);
 	void onControlWrite(const uint8_t *data, size_t len);
+	uint32_t passkey() const { return _passkey; }
 
 private:
+	static const uint8_t CMD_QUEUE = 4;
+	static const uint8_t CMD_MAX_LEN = 8;
+	struct Command { uint8_t len; uint8_t d[CMD_MAX_LEN]; };
+
 	String _deviceId = "";
 	volatile bool _on = false;
 	volatile bool _connected = false;
@@ -68,17 +77,33 @@ private:
 	volatile uint16_t _mtu = 23;
 	volatile uint16_t _connHandle = 0xFFFF;
 	volatile bool _dataSubscribed = false;
+	volatile bool _pairingOpen = false;
+	uint32_t _pairingUntil = 0;
+	uint32_t _passkey = 0;
+
 	uint16_t _seq = 0;
 	uint32_t _lastStatusMs = 0;
 	uint8_t _profile = 0;
 	uint8_t _batteryPct = 0xFF;			// 0xFF = unknown until a B% record has been seen
 	swea::RecordRing _ring;
 	uint8_t *_ringMem = nullptr;
+	swea::FrameWindow _win;				// last sent notifications, for RESUME_FROM
+	uint8_t *_winMem = nullptr;
+	bool _replay = false;
+	uint16_t _replaySeq = 0, _replayEnd = 0;
+	bool _gap = false;					// last RESUME_FROM asked for frames that were no longer held
 	swea::ParsedPacket _pp;
 	uint32_t _notifyFailures = 0;
 
+	Command _cmds[CMD_QUEUE];
+	volatile uint8_t _cmdHead = 0, _cmdTail = 0;
+	portMUX_TYPE _cmdMux = portMUX_INITIALIZER_UNLOCKED;
+
 	void handleLine(const char *s, size_t len);
 	void drain();
+	void processCommands();
+	void execute(const Command &c);
+	void loadPasskey();
 
 	void startBle();
 	void stopBle();

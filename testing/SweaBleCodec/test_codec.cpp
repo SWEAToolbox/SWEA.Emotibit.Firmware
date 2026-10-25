@@ -132,6 +132,33 @@ int main()
 		CHECK(buildNotification(ring, 0, out, sizeof(out)) == 0);
 	}
 
+
+	// 10. FrameWindow: store, get, overwrite oldest, ack, sequence wrap-around.
+	{
+		static uint8_t mem[FrameWindow::bytesFor(4)];
+		FrameWindow w; w.init(mem, 4);
+		uint8_t f[10], o[FrameWindow::MAX_FRAME]; size_t l;
+		CHECK(w.count() == 0);
+		for (uint16_t seq = 65533; seq != (uint16_t)(65533 + 6); seq++)	// crosses the 16-bit wrap
+		{
+			memset(f, (uint8_t)seq, sizeof(f));
+			CHECK(w.store(seq, f, sizeof(f)));
+		}
+		CHECK(w.count() == 4);								// 6 stored, 4 slots
+		CHECK(w.nextSeq() == (uint16_t)(65533 + 6));
+		CHECK(w.oldestSeq() == (uint16_t)(65533 + 2));
+		CHECK(!w.get(65533, o, l) && !w.get(65534, o, l));	// overwritten
+		CHECK(w.get(65535, o, l) && l == 10 && o[0] == 0xFF);
+		CHECK(w.get(0, o, l) && o[0] == 0);				// after the wrap
+		CHECK(w.get(2, o, l) && o[0] == 2);
+		CHECK(!w.get(3, o, l));							// not sent yet
+		w.ack(0);											// frees 65535 and 0
+		CHECK(w.count() == 2 && w.oldestSeq() == 1);
+		w.ack(1000);										// acking beyond the newest empties the window
+		CHECK(w.count() == 0);
+		CHECK(seqBefore(65535, 1) && !seqBefore(1, 65535) && !seqBefore(5, 5));
+	}
+
 	printf("%d checks, %d failed\n", g_checks, g_fail);
 	return g_fail ? 1 : 0;
 }

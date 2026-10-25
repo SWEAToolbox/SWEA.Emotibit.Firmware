@@ -37,9 +37,9 @@ Gap detection: if `seq` is not previous+1 (mod 65536) the app has missed notific
 
 ## 3. Ring buffer and reliability
 - The device keeps the newest **records** in a RAM ring (default 24 KB, `SWEA_BLE_RING_BYTES`; roughly 20 s at the full profile, 1–2 kB/s). When it is full the oldest records are dropped and counted in `Status.dropped`. Notifications are built from the ring at send time. Longer history exists only on the SD card (CSV), which is never modified by this protocol.
-- A notification is only sent when a bonded phone has subscribed to `Data`; if the BLE stack reports back-pressure the records stay in the ring and are retried. Replay by `seq` (`RESUME_FROM`) needs a window of already-sent notifications and arrives with Phase 4.
-- The app acknowledges progress with `ACK(seq)` at least every 5 s while streaming; the device frees ring slots up to `seq`.
-- After reconnecting the app sends `RESUME_FROM(last_seq+1)`. The device replays from that sequence if still in RAM, then continues live data. If it is no longer in RAM, `Status.oldest_seq` shows what is available and `Status.flags.gap` is set; the missing part must be retrieved from the SD card later (FTP/USB), and the app marks the gap in its data.
+- A notification is only sent when a bonded phone has subscribed to `Data`; if the BLE stack reports back-pressure the records stay in the ring and are retried. Replay by `seq` (`RESUME_FROM`) uses a window of the last 32 sent notifications (`SWEA_BLE_WINDOW_FRAMES`, about 8 KB); data older than that is only on the SD card.
+- The app acknowledges progress with `ACK(seq)` at least every 5 s while streaming; the device frees window slots up to and including `seq`. `ACK` has no reply.
+- After reconnecting the app sends `RESUME_FROM(last_seq+1)`. The device replays from that sequence if still in the window, then continues live data (replay has priority over new records). The reply carries the first replayed sequence and `flags` bit0 = gap. If the requested frames are no longer held, replay starts at `Status.oldest_seq`, the gap bit is set in both the reply and `Status.flags`, and the missing part must be retrieved from the SD card later (FTP/USB), and the app marks the gap in its data.
 - If the phone is absent the device keeps recording to the SD card and keeps sampling; BLE is optional for acquisition.
 
 ## 4. Control characteristic
@@ -86,10 +86,10 @@ Phone performs 8 `TIME_SYNC` exchanges after connecting, picks the pair with the
 Notified on state change and at 1 Hz while streaming.
 
 ## 6. Security
-- Pairing: LE Secure Connections, bonding, **passkey entry**. The device has no display, so the 6-digit passkey is fixed per device, derived from a factory secret, and provided to the user as a QR code `swea-eb://v1?id=<deviceId>&pk=<passkey>` on the device label or in the SWEA backend. The app scans it with the existing QR scanner.
-- Pairing mode (accepting new bonds) is opened only for 120 s by a button combination, or by `ENTER_PAIRING` from an already bonded phone. Max 2 bonds; `CLEAR_BONDS` or long button hold erases.
+- Pairing: LE Secure Connections, bonding, **passkey entry**. The device has no display, so the 6-digit passkey is fixed per device, generated randomly on first boot and kept in NVS (a factory-provisioned secret is the production alternative), and provided to the user as a QR code `swea-eb://v1?id=<deviceId>&pk=<passkey>` on the device label or in the SWEA backend. The app scans it with the existing QR scanner.
+- Pairing mode (accepting new bonds) is opened for 120 s by a short button press, automatically at boot while no phone is bonded, or by `ENTER_PAIRING` from an already bonded phone. A phone that is not bonded is disconnected immediately while the window is closed. Max 2 bonds (the oldest is forgotten); `CLEAR_BONDS` erases all.
 - All characteristics use encrypted-read/encrypted-write permissions; unencrypted access fails with ATT "insufficient authentication".
-- Advertising uses a resolvable private address, contains only the service UUID and short name, never personal data.
+- Advertising contains only the service UUID and short name, never personal data. A resolvable private address is available with `-DSWEA_BLE_PRIVACY` (off by default until verified on hardware).
 - The firmware validates every length and index in Control writes.
 
 ## 7. Versioning

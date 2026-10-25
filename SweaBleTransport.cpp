@@ -3,15 +3,21 @@
 #ifdef SWEA_BLE
 
 #include <NimBLEDevice.h>
+#include <Preferences.h>
 
-// Development passkey. Production derives a per-device passkey from a factory secret (protocol doc, section 6).
-#ifndef SWEA_BLE_PASSKEY
-#define SWEA_BLE_PASSKEY 123456
-#endif
-#define SWEA_BLE_FW_STRING "swea-ble-0.2"
+// Optional fixed passkey for development builds (-DSWEA_BLE_PASSKEY=123456). Without it every device
+// generates its own random 6-digit passkey on first boot and keeps it in NVS (see loadPasskey()).
+#define SWEA_BLE_FW_STRING "swea-ble-0.3"
 // RAM for the record ring (newest data is kept when it is full; the SD card keeps everything).
 #ifndef SWEA_BLE_RING_BYTES
 #define SWEA_BLE_RING_BYTES 24576
+#endif
+// Sent notifications kept for RESUME_FROM (about 250 bytes each).
+#ifndef SWEA_BLE_WINDOW_FRAMES
+#define SWEA_BLE_WINDOW_FRAMES 32
+#endif
+#ifndef SWEA_BLE_MAX_BONDS
+#define SWEA_BLE_MAX_BONDS 2
 #endif
 
 namespace
@@ -27,7 +33,11 @@ namespace
 		OP_START_STREAM = 0x02,
 		OP_STOP_STREAM = 0x03,
 		OP_TIME_SYNC = 0x04,
-		OP_SET_PROFILE = 0x07
+		OP_RESUME_FROM = 0x05,
+		OP_ACK = 0x06,
+		OP_SET_PROFILE = 0x07,
+		OP_ENTER_PAIRING = 0x0A,
+		OP_CLEAR_BONDS = 0x0B
 	};
 	enum ReplyStatus : uint8_t
 	{
@@ -44,15 +54,33 @@ namespace
 	NimBLECharacteristic *g_status = nullptr;
 	SweaBleTransport *g_owner = nullptr;
 	uint8_t g_bootCount = 0;
+	uint32_t g_passkey = 123456;
 
+	using swea::get16;
 	using swea::put16;
 	using swea::put32;
+
+	// Connection parameters (protocol doc, section 1): interval 100-200 ms, latency 4, supervision timeout 6 s.
+	const uint16_t CONN_MIN_INTERVAL = 80;	// units of 1.25 ms
+	const uint16_t CONN_MAX_INTERVAL = 160;
+	const uint16_t CONN_LATENCY = 4;
+	const uint16_t CONN_TIMEOUT = 600;		// units of 10 ms
 
 	class ServerCallbacks : public NimBLEServerCallbacks
 	{
 		void onConnect(NimBLEServer *server, ble_gap_conn_desc *desc) override
 		{
-			if (g_owner) g_owner->onConnected(desc->conn_handle);
+			// Only phones that are already bonded may connect, unless the pairing window is open.
+			NimBLEAddress peer(desc->peer_id_addr);
+			bool allowed = g_owner && (g_owner->isPairingOpen() || NimBLEDevice::isBonded(peer));
+			if (!allowed)
+			{
+				Serial.println("SWEA BLE: rejected a connection from an unbonded phone (pairing window closed)");
+				server->disconnect(desc->conn_handle);
+				return;
+			}
+			g_owner->onConnected(desc->conn_handle);
+			server->updateConnParams(desc->conn_handle, CONN_MIN_INTERVAL, CONN_MAX_INTERVAL, CONN_LATENCY, CONN_TIMEOUT);
 			// Ask for encryption right away; data is only sent on an encrypted link.
 			NimBLEDevice::startSecurity(desc->conn_handle);
 		}
@@ -65,13 +93,24 @@ namespace
 		{
 			if (g_owner) g_owner->onMtu(mtu);
 		}
-		uint32_t onPassKeyRequest() override { return SWEA_BLE_PASSKEY; }
+		uint32_t onPassKeyRequest() override { return g_passkey; }
 		void onAuthenticationComplete(ble_gap_conn_desc *desc) override
 		{
 			if (g_owner) g_owner->onEncryptionChange(desc->sec_state.encrypted);
 			if (!desc->sec_state.encrypted)
 			{
 				NimBLEDevice::getServer()->disconnect(desc->conn_handle);	// failed pairing: drop the link
+				return;
+			}
+			// Keep at most SWEA_BLE_MAX_BONDS bonded phones: forget the oldest ones, never the one connected now.
+			NimBLEAddress current(desc->peer_id_addr);
+			for (int guard = 0; guard < 8 && NimBLEDevice::getNumBonds() > SWEA_BLE_MAX_BONDS; guard++)
+			{
+				for (int i = 0; i < NimBLEDevice::getNumBonds(); i++)
+				{
+					NimBLEAddress a = NimBLEDevice::getBondedAddress(i);
+					if (!(a == current)) { NimBLEDevice::deleteBond(a); break; }
+				}
 			}
 		}
 	};
@@ -121,6 +160,12 @@ int8_t SweaBleTransport::update(String &, uint16_t &)
 	if (!_on) return 0;
 	uint32_t now = millis();
 
+	if (_pairingOpen && (int32_t)(now - _pairingUntil) >= 0)
+	{
+		_pairingOpen = false;
+		Serial.println("SWEA BLE: pairing window closed");
+	}
+	processCommands();
 	drain();
 	if (_connected && now - _lastStatusMs >= 1000)
 	{
@@ -130,7 +175,7 @@ int8_t SweaBleTransport::update(String &, uint16_t &)
 	return 0;
 }
 
-uint8_t SweaBleTransport::readControl(String &) { return 0; }	// control opcodes are handled in onControlWrite()
+uint8_t SweaBleTransport::readControl(String &) { return 0; }	// control opcodes are handled in processCommands()
 
 // Receives exactly the text packets that EmotiBit also writes to the SD card (one or more lines).
 int8_t SweaBleTransport::sendData(const String &message)
@@ -161,13 +206,31 @@ void SweaBleTransport::handleLine(const char *s, size_t len)
 	if (swea::profileAllows(_profile, _pp.tag)) _ring.push(_pp.tag, _pp.n, _pp.t_ms, _pp.v);
 }
 
-// Sends queued records as notifications while a bonded phone is subscribed. A few frames per call keep the main loop short.
+// Sends frames while a bonded phone is subscribed: first any requested replay, then new records from the ring.
+// A few frames per call keep the main loop short.
 void SweaBleTransport::drain()
 {
 	if (!_streaming || !_connected || !_encrypted || !_dataSubscribed) return;
 	size_t cap = _mtu > 3 ? (size_t)_mtu - 3 : 20;
 	if (cap > 244) cap = 244;
 	uint8_t buf[244];
+
+	if (_replay)
+	{
+		for (int frame = 0; frame < 6 && _replay; frame++)
+		{
+			if (!swea::seqBefore(_replaySeq, _replayEnd)) { _replay = false; break; }
+			size_t l = 0;
+			if (_win.get(_replaySeq, buf, l))
+			{
+				if (!notifyData(buf, l)) { _notifyFailures++; return; }	// retry the same frame next time
+			}
+			else _gap = true;											// fell out of the window while replaying
+			_replaySeq++;
+		}
+		return;															// live data resumes after the replay
+	}
+
 	for (int frame = 0; frame < 6; frame++)
 	{
 		swea::RecordRing::Cursor c = _ring.cursor();
@@ -179,6 +242,7 @@ void SweaBleTransport::drain()
 			_notifyFailures++;
 			break;
 		}
+		_win.store(_seq, buf, n);
 		_seq++;
 	}
 }
@@ -193,7 +257,46 @@ uint8_t SweaBleTransport::getNumCredentials() { return 0; }
 bool SweaBleTransport::isEnterpriseNetworkListed() { return false; }
 uint8_t SweaBleTransport::getMaxNumCredentialAllowed() { return MAX_CREDENTIALS; }
 
+void SweaBleTransport::openPairing(uint16_t seconds)
+{
+	if (!_on) return;
+	_pairingUntil = millis() + (uint32_t)seconds * 1000UL;
+	_pairingOpen = true;
+	Serial.print("SWEA BLE: pairing open for "); Serial.print(seconds);
+	Serial.print(" s. Passkey: "); Serial.println(_passkey);	// shown on Serial only (USB); also goes on the device label / QR code
+}
+
 // ---------------------------------------------------------------------------------------
+// Per-device passkey: random 6 digits, generated on first boot and kept in NVS. A development build can force one.
+void SweaBleTransport::loadPasskey()
+{
+#ifdef SWEA_BLE_PASSKEY
+	_passkey = SWEA_BLE_PASSKEY;
+	Serial.println("WARNING: fixed development passkey in use");
+#else
+	uint32_t pk = 0;
+	Preferences prefs;
+	if (prefs.begin("swea_ble", false))
+	{
+		pk = prefs.getUInt("passkey", 0);
+		if (pk < 100000 || pk > 999999)
+		{
+			pk = 100000 + (esp_random() % 900000);
+			prefs.putUInt("passkey", pk);
+			Serial.println("SWEA BLE: generated a new device passkey");
+		}
+		prefs.end();
+	}
+	if (pk < 100000 || pk > 999999)
+	{
+		pk = 123456;
+		Serial.println("WARNING: NVS unavailable, falling back to a fixed passkey");
+	}
+	_passkey = pk;
+#endif
+	g_passkey = _passkey;
+}
+
 void SweaBleTransport::startBle()
 {
 	g_owner = this;
@@ -205,6 +308,16 @@ void SweaBleTransport::startBle()
 		if (_ringMem) _ring.init(_ringMem, bytes);
 		else Serial.println("WARNING: no memory for the BLE record ring; data is not forwarded");
 	}
+	if (!_winMem)
+	{
+		_winMem = (uint8_t *)malloc(swea::FrameWindow::bytesFor(SWEA_BLE_WINDOW_FRAMES));
+		if (_winMem) _win.init(_winMem, SWEA_BLE_WINDOW_FRAMES);
+		else Serial.println("WARNING: no memory for the resume window; RESUME_FROM can only report a gap");
+	}
+	_replay = false; _gap = false;
+	_cmdHead = _cmdTail = 0;
+	loadPasskey();
+
 	String suffix = _deviceId.length() >= 4 ? _deviceId.substring(_deviceId.length() - 4) : String("0000");
 	String name = "EmotiBit-" + suffix;
 
@@ -212,7 +325,11 @@ void SweaBleTransport::startBle()
 	NimBLEDevice::setMTU(247);
 	NimBLEDevice::setSecurityAuth(true, true, true);			// bonding, MITM protection, LE Secure Connections
 	NimBLEDevice::setSecurityIOCap(BLE_HS_IO_DISPLAY_ONLY);	// passkey is shown on the label / QR code
-	NimBLEDevice::setSecurityPasskey(SWEA_BLE_PASSKEY);
+	NimBLEDevice::setSecurityPasskey(_passkey);
+#ifdef SWEA_BLE_PRIVACY
+	// Resolvable private address so the phone cannot be tracked by a fixed address. Needs hardware verification.
+	NimBLEDevice::setOwnAddrType(BLE_OWN_ADDR_RPA_PUBLIC_DEFAULT);
+#endif
 
 	g_server = NimBLEDevice::createServer();
 	g_server->setCallbacks(&g_serverCb);
@@ -236,17 +353,17 @@ void SweaBleTransport::startBle()
 	_connected = _encrypted = _streaming = false;
 	sendStatus(false);
 	Serial.print("SWEA BLE advertising as "); Serial.println(name);
-#if SWEA_BLE_PASSKEY == 123456
-	Serial.println("WARNING: development passkey in use");
-#endif
+	if (NimBLEDevice::getNumBonds() == 0) openPairing(120);	// first use: no phone is bonded yet
 }
 
 void SweaBleTransport::stopBle()
 {
 	_on = false;
+	_pairingOpen = false;
 	_connected = _encrypted = _streaming = false;
 	NimBLEDevice::deinit(true);
 	if (_ringMem) { free(_ringMem); _ringMem = nullptr; }
+	if (_winMem) { free(_winMem); _winMem = nullptr; _win.init(nullptr, 0); }
 	g_server = nullptr; g_data = g_control = g_status = nullptr;
 }
 
@@ -267,12 +384,14 @@ void SweaBleTransport::sendStatus(bool notify)
 	uint8_t s[20] = {0};
 	s[0] = PROTOCOL_VERSION;
 	s[1] = !_on ? 0 : (_streaming ? 3 : (_connected ? 2 : 1));
-	s[2] = (_batteryPct != 0xFF && _batteryPct < 20) ? 0x08 : 0;	// bit3 low battery; recording/SD/gap/pairing flags come in Phase 4
+	// flags: bit1 SD ok (the firmware does not start without a card), bit2 gap, bit3 low battery, bit4 pairing open.
+	// bit0 recording is not reported yet.
+	s[2] = 0x02 | (_gap ? 0x04 : 0) | ((_batteryPct != 0xFF && _batteryPct < 20) ? 0x08 : 0) | (_pairingOpen ? 0x10 : 0);
 	s[3] = _batteryPct;						// 0xFF = unknown
 	s[4] = _profile;
 	s[5] = g_bootCount;
 	put16(&s[6], _seq);
-	put16(&s[8], 0);						// oldest_seq: no ring buffer yet
+	put16(&s[8], _win.count() ? _win.oldestSeq() : _seq);
 	put16(&s[10], (uint16_t)_ring.dropped());
 	put32(&s[12], millis());
 	put16(&s[16], (uint16_t)(ESP.getFreeHeap() / 1024));
@@ -292,20 +411,54 @@ void SweaBleTransport::sendControlReply(uint8_t opcode, uint8_t status, const ui
 	g_control->notify();
 }
 
-// ---- BLE callbacks -------------------------------------------------------------------
+// ---- BLE callbacks (host task): flags only -------------------------------------------
 void SweaBleTransport::onConnected(uint16_t connHandle) { _connHandle = connHandle; _connected = true; _encrypted = false; _dataSubscribed = false; _mtu = 23; }
-void SweaBleTransport::onDisconnected() { _connected = false; _encrypted = false; _streaming = false; _dataSubscribed = false; _connHandle = 0xFFFF; }
+void SweaBleTransport::onDisconnected() { _connected = false; _encrypted = false; _streaming = false; _dataSubscribed = false; _replay = false; _connHandle = 0xFFFF; }
 void SweaBleTransport::onEncryptionChange(bool encrypted) { _encrypted = encrypted; }
 void SweaBleTransport::onMtu(uint16_t mtu) { _mtu = mtu; }
 void SweaBleTransport::onSubscribe(bool subscribed) { _dataSubscribed = subscribed; }
 
+// A write to Control is queued and executed by update() in the main loop, so the ring, the window and
+// the replay state are only ever touched from one task.
 void SweaBleTransport::onControlWrite(const uint8_t *data, size_t len)
 {
 	if (len < 1) return;
-	uint8_t op = data[0];
+	Command c;
+	c.len = len > CMD_MAX_LEN ? 0xFF : (uint8_t)len;	// 0xFF marks an over-long (invalid) command
+	memcpy(c.d, data, len > CMD_MAX_LEN ? CMD_MAX_LEN : len);
+	portENTER_CRITICAL(&_cmdMux);
+	uint8_t next = (_cmdHead + 1) % CMD_QUEUE;
+	if (next != _cmdTail) { _cmds[_cmdHead] = c; _cmdHead = next; }	// a full queue drops the write
+	portEXIT_CRITICAL(&_cmdMux);
+}
+
+void SweaBleTransport::processCommands()
+{
+	for (int i = 0; i < CMD_QUEUE; i++)
+	{
+		Command c;
+		portENTER_CRITICAL(&_cmdMux);
+		bool have = _cmdTail != _cmdHead;
+		if (have) { c = _cmds[_cmdTail]; _cmdTail = (_cmdTail + 1) % CMD_QUEUE; }
+		portEXIT_CRITICAL(&_cmdMux);
+		if (!have) return;
+		execute(c);
+	}
+}
+
+void SweaBleTransport::execute(const Command &c)
+{
+	uint8_t op = c.d[0];
+	size_t len = c.len;
+	const uint8_t *data = c.d;
 	if (!_encrypted)
 	{
 		sendControlReply(op, ST_NOT_ALLOWED, nullptr, 0);
+		return;
+	}
+	if (c.len == 0xFF)
+	{
+		sendControlReply(op, ST_BAD_ARGS, nullptr, 0);
 		return;
 	}
 	switch (op)
@@ -325,10 +478,12 @@ void SweaBleTransport::onControlWrite(const uint8_t *data, size_t len)
 		if (len != 2 || data[1] > 2) { sendControlReply(op, ST_BAD_ARGS, nullptr, 0); break; }
 		_profile = data[1];
 		_streaming = true;
+		_gap = false;
 		sendControlReply(op, ST_OK, nullptr, 0);
 		break;
 	case OP_STOP_STREAM:
 		_streaming = false;
+		_replay = false;
 		sendControlReply(op, ST_OK, nullptr, 0);
 		break;
 	case OP_TIME_SYNC:
@@ -340,10 +495,45 @@ void SweaBleTransport::onControlWrite(const uint8_t *data, size_t len)
 		sendControlReply(op, ST_OK, out, sizeof(out));
 		break;
 	}
+	case OP_RESUME_FROM:
+	{
+		if (len != 3) { sendControlReply(op, ST_BAD_ARGS, nullptr, 0); break; }
+		uint16_t req = get16(&data[1]);
+		if (swea::seqBefore(_seq, req)) { sendControlReply(op, ST_BAD_ARGS, nullptr, 0); break; }	// asks for frames that were never sent
+		uint16_t oldest = _win.count() ? _win.oldestSeq() : _seq;
+		bool gap = swea::seqBefore(req, oldest);
+		uint16_t first = gap ? oldest : req;
+		_gap = gap;
+		_replaySeq = first;
+		_replayEnd = _seq;
+		_replay = first != _seq;
+		uint8_t out[3];
+		put16(out, first);
+		out[2] = gap ? 1 : 0;
+		sendControlReply(op, ST_OK, out, sizeof(out));
+		break;
+	}
+	case OP_ACK:
+		if (len != 3) break;			// no reply for ACK (protocol doc)
+		_win.ack(get16(&data[1]));
+		break;
 	case OP_SET_PROFILE:
 		if (len != 2 || data[1] > 2) { sendControlReply(op, ST_BAD_ARGS, nullptr, 0); break; }
 		_profile = data[1];
 		sendControlReply(op, ST_OK, nullptr, 0);
+		break;
+	case OP_ENTER_PAIRING:
+	{
+		if (len != 2) { sendControlReply(op, ST_BAD_ARGS, nullptr, 0); break; }
+		openPairing(data[1] == 0 ? 120 : data[1]);
+		sendControlReply(op, ST_OK, nullptr, 0);
+		break;
+	}
+	case OP_CLEAR_BONDS:
+		sendControlReply(op, ST_OK, nullptr, 0);
+		NimBLEDevice::deleteAllBonds();
+		Serial.println("SWEA BLE: all bonds deleted");
+		disconnect();
 		break;
 	default:
 		sendControlReply(op, ST_UNSUPPORTED, nullptr, 0);

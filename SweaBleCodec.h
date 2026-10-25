@@ -183,6 +183,59 @@ namespace swea
 		void dropHead() { dropHeadInternal(); _dropped++; }
 	};
 
+	/** Window of the most recently sent notifications, for RESUME_FROM replay. Fixed slots, oldest overwritten.
+	 *  Sequence numbers are compared modulo 2^16. */
+	class FrameWindow
+	{
+	public:
+		static const size_t MAX_FRAME = 244;
+		static const size_t SLOT_BYTES = 2 + 1 + MAX_FRAME;	// seq:u16 len:u8 data
+
+		void init(uint8_t *mem, size_t slots) { _m = mem; _slots = slots; _head = 0; _count = 0; _next = 0; }
+		static constexpr size_t bytesFor(size_t slots) { return slots * SLOT_BYTES; }
+		size_t count() const { return _count; }
+		uint16_t nextSeq() const { return _next; }	// sequence number after the newest stored frame
+		uint16_t oldestSeq() const { return (uint16_t)(_next - _count); }
+
+		/** Store a frame that was just sent. Frames must be stored with consecutive sequence numbers. */
+		bool store(uint16_t seq, const uint8_t *data, size_t len)
+		{
+			if (!_m || len == 0 || len > MAX_FRAME) return false;
+			if (_count == _slots) { _head = (_head + 1) % _slots; _count--; }
+			size_t idx = (_head + _count) % _slots;
+			uint8_t *slot = _m + idx * SLOT_BYTES;
+			put16(slot, seq); slot[2] = (uint8_t)len; memcpy(slot + 3, data, len);
+			_count++;
+			_next = (uint16_t)(seq + 1);
+			return true;
+		}
+
+		/** Copy the frame with this sequence number. False if it is not (or no longer) in the window. */
+		bool get(uint16_t seq, uint8_t *out, size_t &len) const
+		{
+			uint16_t off = (uint16_t)(seq - oldestSeq());
+			if (off >= _count) return false;
+			const uint8_t *slot = _m + ((_head + off) % _slots) * SLOT_BYTES;
+			len = slot[2];
+			memcpy(out, slot + 3, len);
+			return true;
+		}
+
+		/** The phone has received everything up to and including seq: free those slots. */
+		void ack(uint16_t seq)
+		{
+			while (_count > 0 && (int16_t)(oldestSeq() - seq) <= 0) { _head = (_head + 1) % _slots; _count--; }
+		}
+
+	private:
+		uint8_t *_m = nullptr;
+		size_t _slots = 0, _head = 0, _count = 0;
+		uint16_t _next = 0;
+	};
+
+	/** True if sequence a is before b (modulo 2^16). */
+	inline bool seqBefore(uint16_t a, uint16_t b) { return (int16_t)(a - b) < 0; }
+
 	/** Build one data notification from the head of the ring.
 	 *  maxLen is the usable notification payload (ATT_MTU - 3). Returns the length (0 = nothing to send or no room).
 	 *  Records that do not fit entirely are split into several records with the same t_ms.

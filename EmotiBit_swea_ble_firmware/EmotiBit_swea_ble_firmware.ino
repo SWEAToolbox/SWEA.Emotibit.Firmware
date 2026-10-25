@@ -10,6 +10,11 @@ float data[dataSize];
 
 void onShortButtonPress()
 {
+#ifdef SWEA_BLE
+	// SWEA BLE build: a short press opens the pairing window (120 s) for a new phone and prints the passkey on Serial.
+	emotibit._emotiBitWiFi.openPairing(120);
+	return;
+#endif
 	// toggle wifi on/off
 	if (emotibit.getPowerMode() == EmotiBit::PowerMode::NORMAL_POWER)
 	{
