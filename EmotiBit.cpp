@@ -3629,8 +3629,12 @@ bool EmotiBit::loadConfigFile(const String &filename)
 				Serial.print(" -username:"); Serial.print(username);
 			}
 		}
+#ifdef SWEA_BLE
+		Serial.print(" -pass:***"); // SWEA: never print Wi-Fi passwords to Serial (upstream prints them in clear text)
+#else
 		Serial.print(" -pass:" + pass);
-		
+#endif
+
 		if (_emotiBitWiFi.addCredential(ssid, userid, username, pass) < 0)
 		{
 			// Number of credentials exceeded max allowed

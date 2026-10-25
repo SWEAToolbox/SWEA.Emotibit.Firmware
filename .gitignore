@@ -25,3 +25,6 @@
 # EmotiBit workflow specific
 stage-release/
 **/*.zip
+
+# SWEA tools
+.venv-tools/

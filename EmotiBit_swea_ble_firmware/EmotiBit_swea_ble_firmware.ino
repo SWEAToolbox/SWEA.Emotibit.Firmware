@@ -43,9 +43,15 @@ void setup()
 	String inoFilename = __FILE__;  // returns absolute path of ino file
 	inoFilename.replace("/","\\");  // conform to standard directory separator
 	// extract filename only if directory separator found in absolute path
+	// SWEA: take the file name after the last separator and cut at its last dot. The stock code cuts at the
+	// first dot of the whole path, which breaks when a folder name contains a dot (e.g. SWEA.EmotiBit_FeatherWing).
 	if(inoFilename.lastIndexOf("\\") != -1)
 	{
-		inoFilename = inoFilename.substring((inoFilename.lastIndexOf("\\")) + 1,(inoFilename.indexOf(".")));
+		inoFilename = inoFilename.substring(inoFilename.lastIndexOf("\\") + 1);
+	}
+	if(inoFilename.lastIndexOf(".") > 0)
+	{
+		inoFilename = inoFilename.substring(0, inoFilename.lastIndexOf("."));
 	}
 	emotibit.setup(inoFilename);
 
