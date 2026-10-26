@@ -371,4 +371,41 @@ namespace swea
 		out[n++] = 0;
 		return n;
 	}
+
+	// Rate limiter for new pairings (firmware 0.12: an unknown phone may pair at any time, the passkey is the only secret).
+	// After FAILS_BEFORE_LOCKOUT consecutive failed pairings the board refuses new pairings for 60 s; every further lockout
+	// doubles the time, up to 15 min. A success or reset() (reboot, button) starts over. Times are millis(), wrap-safe.
+	class PairingGuard
+	{
+	public:
+		static const uint8_t FAILS_BEFORE_LOCKOUT = 5;
+		static const uint32_t BASE_LOCKOUT_MS = 60000u;
+		static const uint32_t MAX_LOCKOUT_MS = 900000u;
+
+		bool locked(uint32_t now) const { return _locked && (int32_t)(now - _until) < 0; }
+		uint32_t remainingMs(uint32_t now) const { return locked(now) ? (uint32_t)(_until - now) : 0; }
+		uint8_t lockouts() const { return _lockouts; }
+
+		// A pairing attempt that failed. Ignored while locked (the board refused it anyway).
+		void recordFailure(uint32_t now)
+		{
+			if (locked(now)) return;
+			_locked = false;
+			if (++_fails < FAILS_BEFORE_LOCKOUT) return;
+			_fails = 0;
+			uint32_t d = BASE_LOCKOUT_MS;
+			for (uint8_t i = 0; i < _lockouts && d < MAX_LOCKOUT_MS; i++) d *= 2;
+			if (d > MAX_LOCKOUT_MS) d = MAX_LOCKOUT_MS;
+			if (_lockouts < 255) _lockouts++;
+			_until = now + d;
+			_locked = true;
+		}
+		void recordSuccess() { reset(); }
+		void reset() { _fails = 0; _lockouts = 0; _locked = false; _until = 0; }
+
+	private:
+		uint8_t _fails = 0, _lockouts = 0;
+		bool _locked = false;
+		uint32_t _until = 0;
+	};
 }

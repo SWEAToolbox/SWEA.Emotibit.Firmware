@@ -57,7 +57,9 @@ public:
 	/** The SD card file system (owned by EmotiBit; the Arduino SD object on the ESP32) for the session outbox. Without it the outbox is unavailable. Call once the card is up. */
 	void setSd(fs::FS *sd) { _sd = sd; }
 
-	/** Accept pairing with new phones for this many seconds (button press or ENTER_PAIRING). Prints the passkey on Serial. */
+	/** Opens the pairing window for this many seconds (button press, boot without bonds, ENTER_PAIRING), prints the passkey on
+	 *  Serial and lifts a PairingGuard lockout. Since firmware 0.12 an unknown phone can pair with the correct passkey even
+	 *  while the window is closed; the window only extends the time a phone has to finish the pairing. */
 	void openPairing(uint16_t seconds = 120);
 	bool isPairingOpen() const { return _pairingOpen; }
 

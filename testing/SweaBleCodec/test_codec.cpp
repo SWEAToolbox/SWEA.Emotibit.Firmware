@@ -306,6 +306,45 @@ int main()
 		CHECK(ix.find(probe, off, skip) && skip == 12345 % 4 && off == (uint32_t)(12345 - 12345 % 4) * 203);
 	}
 
+	{	// PairingGuard: 5 failed pairings lock for 60 s, doubling to 15 min; reset on success or reset()
+		PairingGuard g;
+		uint32_t t = 1000;
+		CHECK(!g.locked(t) && g.lockouts() == 0);
+		for (int i = 0; i < 4; i++) { g.recordFailure(t); CHECK(!g.locked(t)); }
+		g.recordSuccess();									// a success clears the failure count
+		for (int i = 0; i < 4; i++) g.recordFailure(t);
+		CHECK(!g.locked(t));
+		g.recordFailure(t);									// fifth consecutive failure
+		CHECK(g.locked(t) && g.remainingMs(t) == 60000 && g.lockouts() == 1);
+		CHECK(g.locked(t + 59999) && !g.locked(t + 60000) && g.remainingMs(t + 60000) == 0);
+		g.recordFailure(t + 10);							// ignored while locked
+		CHECK(g.remainingMs(t + 10) == 59990);
+		t += 60000;											// lockout over: five more failures, twice as long
+		for (int i = 0; i < 4; i++) { g.recordFailure(t); CHECK(!g.locked(t)); }
+		g.recordFailure(t);
+		CHECK(g.locked(t) && g.remainingMs(t) == 120000 && g.lockouts() == 2);
+		uint32_t expect[] = { 240000, 480000, 900000, 900000 };	// 4, 8 min, then capped at 15 min
+		for (int k = 0; k < 4; k++)
+		{
+			t += g.remainingMs(t);
+			for (int i = 0; i < 5; i++) g.recordFailure(t);
+			CHECK(g.remainingMs(t) == expect[k]);
+		}
+		g.recordSuccess();
+		CHECK(!g.locked(t) && g.lockouts() == 0);
+		for (int i = 0; i < 5; i++) g.recordFailure(t);
+		CHECK(g.remainingMs(t) == 60000);					// back to the first step after a success
+		g.reset();											// button, reboot
+		CHECK(!g.locked(t) && g.lockouts() == 0);
+		for (int i = 0; i < 5; i++) g.recordFailure(t);
+		CHECK(g.remainingMs(t) == 60000);
+		// millis() wrap-around
+		PairingGuard w;
+		uint32_t near = 0xFFFFFFFFu - 20000u;
+		for (int i = 0; i < 5; i++) w.recordFailure(near);
+		CHECK(w.locked(near + 59999u) && !w.locked(near + 60000u) && w.remainingMs(near + 30000u) == 30000);
+	}
+
 	printf("%d checks, %d failed\n", g_checks, g_fail);
 	return g_fail ? 1 : 0;
 }
