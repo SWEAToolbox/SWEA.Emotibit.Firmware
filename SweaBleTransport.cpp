@@ -5,10 +5,13 @@
 #include <NimBLEDevice.h>
 #include <Preferences.h>
 #include <time.h>
+#include <nvs.h>
+
+extern "C" int ble_rpa_get_num_peer_dev_records(void);
 
 // Optional fixed passkey for development builds (-DSWEA_BLE_PASSKEY=123456). Without it every device
 // generates its own random 6-digit passkey on first boot and keeps it in NVS (see loadPasskey()).
-#define SWEA_BLE_FW_STRING "swea-ble-0.8"
+#define SWEA_BLE_FW_STRING "swea-ble-0.10"
 // Longest Control notification (opcode, status and arguments). Needs an MTU above 23, which the phone always asks for.
 #define CONTROL_REPLY_MAX 64
 // RAM for the record ring (newest data is kept when it is full; the SD card keeps everything).
@@ -19,9 +22,9 @@
 #ifndef SWEA_BLE_WINDOW_FRAMES
 #define SWEA_BLE_WINDOW_FRAMES 32
 #endif
-#ifndef SWEA_BLE_MAX_BONDS
-#define SWEA_BLE_MAX_BONDS 2
-#endif
+// The number of bonded devices is NimBLE's own limit (CONFIG_BT_NIMBLE_MAX_BONDS in platformio.ini). When the store is full
+// NimBLE forgets the oldest bond. We do not prune ourselves: that ran before the phone's identity was known and could delete
+// the phone's own new bond.
 
 namespace
 {
@@ -76,24 +79,35 @@ namespace
 	// At most one data notification per this many ms (about 10 kB/s at full MTU, five times the full profile), so NimBLE's
 	// buffers never fill up and Control replies and writes still get through.
 	const uint32_t NOTIFY_SPACING_MS = 25;
+	// A connection that is not encrypted by then (no bond and no pairing) is dropped. While the pairing window is open
+	// the user may still be tapping the phone's pairing notification and typing the passkey, so it gets much longer.
+	const uint32_t ENCRYPT_TIMEOUT_MS = 15000;
+	const uint32_t PAIRING_ENCRYPT_TIMEOUT_MS = 90000;
 
 	class ServerCallbacks : public NimBLEServerCallbacks
 	{
 		void onConnect(NimBLEServer *server, ble_gap_conn_desc *desc) override
 		{
-			// Only phones that are already bonded may connect, unless the pairing window is open.
-			NimBLEAddress peer(desc->peer_id_addr);
-			bool allowed = g_owner && (g_owner->isPairingOpen() || NimBLEDevice::isBonded(peer));
-			if (!allowed)
-			{
-				Serial.println("SWEA BLE: rejected a connection from an unbonded phone (pairing window closed)");
-				server->disconnect(desc->conn_handle);
-				return;
-			}
+			// The address is not checked here: a bonded Android phone connects with a resolvable private address that is
+			// only known to be "ours" once the link is encrypted with its bond. The gate is encryption: a bonded phone
+			// encrypts with its stored keys, a new pairing is refused while the pairing window is closed (onPassKeyRequest),
+			// and a link that is not encrypted within ENCRYPT_TIMEOUT_MS is dropped (update()). No data or command is
+			// served before encryption.
+			if (!g_owner) return;
 			g_owner->onConnected(desc->conn_handle);
 			server->updateConnParams(desc->conn_handle, CONN_MIN_INTERVAL, CONN_MAX_INTERVAL, CONN_LATENCY, CONN_TIMEOUT);
-			// Ask for encryption right away; data is only sent on an encrypted link.
-			NimBLEDevice::startSecurity(desc->conn_handle);
+			// A bonded phone (its private address resolved to its identity) is asked to encrypt right away. An unknown one
+			// is given a few seconds first: if the phone's app starts the pairing itself, Android asks for the passkey
+			// directly and the app can supply it; our Security Request would instead make Android ask the user to confirm.
+			NimBLEAddress id(desc->peer_id_addr);
+			bool bonded = NimBLEDevice::isBonded(id);
+			Serial.print("SWEA BLE: connected "); Serial.print(NimBLEAddress(desc->peer_ota_addr).toString().c_str());
+			Serial.print(" id "); Serial.print(id.toString().c_str());
+			Serial.print(bonded ? " (bonded)" : " (not bonded)");
+			Serial.print(", bonds "); Serial.print(NimBLEDevice::getNumBonds());
+			Serial.print(", peer records "); Serial.println(ble_rpa_get_num_peer_dev_records());
+			if (bonded) NimBLEDevice::startSecurity(desc->conn_handle);
+			else g_owner->requestSecurityLater();
 		}
 		void onDisconnect(NimBLEServer *server) override
 		{
@@ -104,25 +118,22 @@ namespace
 		{
 			if (g_owner) g_owner->onMtu(mtu);
 		}
-		uint32_t onPassKeyRequest() override { return g_passkey; }
+		uint32_t onPassKeyRequest() override
+		{
+			// Only called for a new pairing (a bonded phone re-encrypts without it).
+			if (g_owner && g_owner->isPairingOpen()) return g_passkey;
+			Serial.println("SWEA BLE: refused a new pairing (pairing window closed)");
+			return (g_passkey + 1) % 1000000;	// cannot match the phone's passkey, so the pairing fails
+		}
 		void onAuthenticationComplete(ble_gap_conn_desc *desc) override
 		{
 			if (g_owner) g_owner->onEncryptionChange(desc->sec_state.encrypted);
+			Serial.print("SWEA BLE: encryption ");
+			Serial.print(desc->sec_state.encrypted ? "on" : "FAILED");
+			Serial.print(desc->sec_state.bonded ? ", bonded" : ", not bonded");
+			Serial.print(", id "); Serial.println(NimBLEAddress(desc->peer_id_addr).toString().c_str());
 			if (!desc->sec_state.encrypted)
-			{
 				NimBLEDevice::getServer()->disconnect(desc->conn_handle);	// failed pairing: drop the link
-				return;
-			}
-			// Keep at most SWEA_BLE_MAX_BONDS bonded phones: forget the oldest ones, never the one connected now.
-			NimBLEAddress current(desc->peer_id_addr);
-			for (int guard = 0; guard < 8 && NimBLEDevice::getNumBonds() > SWEA_BLE_MAX_BONDS; guard++)
-			{
-				for (int i = 0; i < NimBLEDevice::getNumBonds(); i++)
-				{
-					NimBLEAddress a = NimBLEDevice::getBondedAddress(i);
-					if (!(a == current)) { NimBLEDevice::deleteBond(a); break; }
-				}
-			}
 		}
 	};
 
@@ -175,6 +186,17 @@ int8_t SweaBleTransport::update(String &, uint16_t &)
 	{
 		_pairingOpen = false;
 		Serial.println("SWEA BLE: pairing window closed");
+	}
+	if (_securityAtMs && _connected && !_encrypted && (int32_t)(now - _securityAtMs) >= 0)
+	{
+		_securityAtMs = 0;
+		NimBLEDevice::startSecurity(_connHandle);	// the phone did not start a pairing itself: ask for one
+	}
+	if (_connected && !_encrypted && now - _connectedAtMs > (_pairingOpen ? PAIRING_ENCRYPT_TIMEOUT_MS : ENCRYPT_TIMEOUT_MS))
+	{
+		Serial.println("SWEA BLE: dropped a connection that did not encrypt (not bonded, pairing window closed?)");
+		_connectedAtMs = now;	// once
+		disconnect();
 	}
 	processCommands();
 	drain();
@@ -362,7 +384,8 @@ void SweaBleTransport::startBle()
 	NimBLEDevice::setMTU(247);
 	NimBLEDevice::setSecurityAuth(true, true, true);			// bonding, MITM protection, LE Secure Connections
 	NimBLEDevice::setSecurityIOCap(BLE_HS_IO_DISPLAY_ONLY);	// passkey is shown on the label / QR code
-	NimBLEDevice::setSecurityPasskey(_passkey);
+	// No setSecurityPasskey(): NimBLE-Arduino only asks onPassKeyRequest() while the static passkey is its default, and that
+	// callback is where the pairing window is enforced. It hands out the per-device passkey only while the window is open.
 #ifdef SWEA_BLE_PRIVACY
 	// Resolvable private address so the phone cannot be tracked by a fixed address. Needs hardware verification.
 	NimBLEDevice::setOwnAddrType(BLE_OWN_ADDR_RPA_PUBLIC_DEFAULT);
@@ -390,6 +413,8 @@ void SweaBleTransport::startBle()
 	_connected = _encrypted = _streaming = false;
 	sendStatus(false);
 	Serial.print("SWEA BLE advertising as "); Serial.println(name);
+	Serial.print("SWEA BLE: bonds "); Serial.print(NimBLEDevice::getNumBonds());
+	Serial.print(", peer records "); Serial.println(ble_rpa_get_num_peer_dev_records());
 	if (NimBLEDevice::getNumBonds() == 0) openPairing(120);	// first use: no phone is bonded yet
 }
 
@@ -449,7 +474,7 @@ void SweaBleTransport::sendControlReply(uint8_t opcode, uint8_t status, const ui
 }
 
 // ---- BLE callbacks (host task): flags only -------------------------------------------
-void SweaBleTransport::onConnected(uint16_t connHandle) { _connHandle = connHandle; _connected = true; _encrypted = false; _dataSubscribed = false; _mtu = 23; }
+void SweaBleTransport::onConnected(uint16_t connHandle) { _connHandle = connHandle; _connectedAtMs = millis(); _connected = true; _encrypted = false; _dataSubscribed = false; _mtu = 23; }
 void SweaBleTransport::onDisconnected() { _connected = false; _encrypted = false; _streaming = false; _dataSubscribed = false; _replay = false; _connHandle = 0xFFFF; }
 void SweaBleTransport::onEncryptionChange(bool encrypted) { _encrypted = encrypted; }
 void SweaBleTransport::onMtu(uint16_t mtu) { _mtu = mtu; }
@@ -603,11 +628,27 @@ void SweaBleTransport::execute(const Command &c)
 		break;
 	}
 	case OP_CLEAR_BONDS:
+	{
+		// deleteAllBonds() leaves NimBLE's resolving list and peer records behind, which later breaks the recognition of
+		// phones with private addresses. Wipe NimBLE's whole store and restart (the passkey lives elsewhere and stays).
 		sendControlReply(op, ST_OK, nullptr, 0);
+		delay(300);
+		// Erase while NimBLE still runs (deinit can close the NVS handle first), then restart at once so nothing in RAM is
+		// written back.
 		NimBLEDevice::deleteAllBonds();
-		Serial.println("SWEA BLE: all bonds deleted");
-		disconnect();
+		nvs_handle_t h;
+		esp_err_t err = nvs_open("nimble_bond", NVS_READWRITE, &h);
+		if (err == ESP_OK)
+		{
+			err = nvs_erase_all(h);
+			if (err == ESP_OK) err = nvs_commit(h);
+			nvs_close(h);
+		}
+		Serial.print("SWEA BLE: cleared all bonds (nvs result "); Serial.print((int)err); Serial.println("), restarting");
+		delay(100);
+		ESP.restart();
 		break;
+	}
 	default:
 		sendControlReply(op, ST_UNSUPPORTED, nullptr, 0);
 	}

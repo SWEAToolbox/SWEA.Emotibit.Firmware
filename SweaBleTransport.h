@@ -57,6 +57,7 @@ public:
 
 	// Called from the BLE callbacks (NimBLE host task). They only set flags or queue work for update().
 	void onConnected(uint16_t connHandle);
+	void requestSecurityLater() { _securityAtMs = millis() + 4000; }
 	void onDisconnected();
 	void onEncryptionChange(bool encrypted);
 	void onMtu(uint16_t mtu);
@@ -95,6 +96,8 @@ private:
 	swea::ParsedPacket _pp;
 	uint32_t _notifyFailures = 0;
 	uint32_t _lastNotifyMs = 0;
+	uint32_t _connectedAtMs = 0;
+	uint32_t _securityAtMs = 0;
 	bool _recording = false;				// as commanded over BLE (RECORD); the SD card state is owned by EmotiBit
 	static const uint8_t CTRL_OUT = 4;
 	String _ctrlOut[CTRL_OUT];			// text control packets that EmotiBit's own parser consumes via readControl()

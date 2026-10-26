@@ -262,8 +262,14 @@ def cmd_restore(args):
 def cmd_monitor(args):
     need("serial", "Run tools/setup first.")
     import serial
+    # Open with DTR and RTS released: on the Feather they drive EN/IO0, and asserting them while opening restarts
+    # the board (which also closes an open pairing window). Only --reset restarts it on purpose.
+    s = serial.Serial()
+    s.port, s.baudrate, s.timeout = args.port, args.baud, 0.2
+    s.dtr = False
+    s.rts = False
     try:
-        s = serial.Serial(args.port, args.baud, timeout=0.2)
+        s.open()
     except serial.SerialException as e:
         sys.exit(f"Cannot open {args.port}: {e}")
     if args.reset:
