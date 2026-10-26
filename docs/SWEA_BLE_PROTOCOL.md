@@ -42,6 +42,13 @@ Gap detection: if `seq` is not previous+1 (mod 65536) the app has missed notific
 - After reconnecting the app sends `RESUME_FROM(last_seq+1)`. The device replays from that sequence if still in the window, then continues live data (replay has priority over new records). The reply carries the first replayed sequence and `flags` bit0 = gap. If the requested frames are no longer held, replay starts at `Status.oldest_seq`, the gap bit is set in both the reply and `Status.flags`, and the missing part must be retrieved from the SD card later (FTP/USB), and the app marks the gap in its data.
 - If the phone is absent the device keeps recording to the SD card and keeps sampling; BLE is optional for acquisition.
 
+### Session mode and the SD outbox (firmware 0.11)
+- A **session** starts with `START_STREAM` and ends with `STOP_STREAM`. It survives a disconnect, so a phone that drops out and reconnects does not reset anything (`START_STREAM` while a session is active only changes the profile). `Status.state` is 3 while a session is active. Without a session nothing is turned into notifications.
+- During a session notifications are built from the ring with a **continuous `seq` even when no phone is connected** (or subscribed). They are kept in the RAM window and appended to `/swea/outbox.bin` on the SD card as records `seq:u16, len:u8, bytes` (the notification exactly as it is sent). Frames sent live to a phone are not written to the outbox, except when the ring is more than 3/4 full (a backlog): then frames go to the outbox instead of waiting in the ring.
+- A RAM index (4096 slots, every 4th record, 16 kB) maps `seq` to file offset: `OutboxIndex` in `SweaBleCodec.h`. The outbox is capped at 4 MB and 16384 notifications (about 20 minutes at the full profile; `SWEA_BLE_OUTBOX_MAX_BYTES`). When it is full, **new notifications are thrown away** (the old ones stay replayable, `seq` is not advanced) and the gap flag (`Status.flags` bit2, `FINISH` flag bit0) is raised. An SD error disables the outbox until `STOP_STREAM` (frames then only live in the window, the ring keeps the newest records).
+- `RESUME_FROM(seq)` replays from the RAM window or, for older frames, from the outbox, in order at the 25 ms notification pacing, and then continues live. Frames produced during a replay are part of it. `first_replayed_seq` in the reply is the oldest sequence held (window or outbox); a sequence that is in neither (a live frame that has left the window without being in the outbox) is skipped and raises the gap flag.
+- `STOP_STREAM` ends the session and deletes the outbox. The outbox is also removed when the next session starts, and a file left over from a power cycle is truncated when the first record of a new session is written.
+
 ## 4. Control characteristic
 
 Write: `opcode:u8, args...`. The device answers by notifying `0x80 | opcode, status:u8, args...` (status 0 = OK, 1 = bad args, 2 = not allowed (not bonded/not in mode), 3 = busy, 4 = unsupported). Lengths are validated; unknown opcodes return status 4.
@@ -49,8 +56,8 @@ Write: `opcode:u8, args...`. The device answers by notifying `0x80 | opcode, sta
 | Opcode | Name | Args | Reply args |
 |---|---|---|---|
 | 0x01 | `GET_INFO` | – | `proto:u8`, `fw` ASCII nul-terminated, `device_id` ASCII nul-terminated (EmotiBit device id, e.g. `MD-V5-0000302`; the phone registers the device on the server with it). Up to 62 argument bytes, so read it after the MTU exchange. Firmware before 0.5 sent no id |
-| 0x02 | `START_STREAM` | `profile:u8` (0..2) | – (data notifications start once `Data` is subscribed) |
-| 0x03 | `STOP_STREAM` | – | – |
+| 0x02 | `START_STREAM` | `profile:u8` (0..2) | – (opens a session, see section 3; data notifications are sent while `Data` is subscribed) |
+| 0x03 | `STOP_STREAM` | – | – (ends the session and clears the SD outbox) |
 | 0x04 | `TIME_SYNC` | `id:u8` | `id:u8, device_ms:u32` taken when the write is handled |
 | 0x05 | `RESUME_FROM` | `seq:u16` | `first_replayed_seq:u16, flags:u8` |
 | 0x06 | `ACK` | `seq:u16` | – (no reply needed; reply suppressed) |
@@ -60,6 +67,7 @@ Write: `opcode:u8, args...`. The device answers by notifying `0x80 | opcode, sta
 | 0x0A | `ENTER_PAIRING` | `seconds:u8` | – (only accepted while bonded; button also opens pairing) |
 | 0x0B | `CLEAR_BONDS` | – | – |
 | 0x0C | `SLEEP` | – | – . Sends EmotiBit's own hibernate packet (`MH`); the board flushes the SD card and powers down. Implemented in firmware 0.4 |
+| 0x0D | `FINISH` | – | `last_seq:u16, flags:u8` (firmware 0.11). End of the measurement: the device stops taking in new values, turns everything still in the ring into notifications (kept in the window and the outbox, not sent), and answers with the last sequence number of the session. The phone then fetches what it is missing with `RESUME_FROM`, up to and including `last_seq`, and finally sends `STOP_STREAM`, which deletes the outbox. `flags` bit0 = notifications were lost during the session (outbox full or SD error, same as `Status.flags` bit2), bit1 = the session produced no notification (`last_seq` is meaningless). Status 2 when no session is active, 1 for arguments. Repeating `FINISH` just repeats the reply |
 
 Profiles (initial): `0` = all channels, `1` = EDA + temperature + motion only (no PPG/MAG, lowest power), `2` = all channels with 100 Hz PPG (only on the 100 Hz firmware build).
 
@@ -71,19 +79,19 @@ Phone performs 8 `TIME_SYNC` exchanges after connecting, picks the pair with the
 | Offset | Field | Type |
 |---|---|---|
 | 0 | `proto` | u8 |
-| 1 | `state` | u8 (0 idle, 1 advertising, 2 connected, 3 streaming, 4 error) |
+| 1 | `state` | u8 (0 idle, 1 advertising, 2 connected, 3 session active, 4 error) |
 | 2 | `flags` | u8 bit0 recording, bit1 SD ok, bit2 gap, bit3 low battery, bit4 pairing open |
 | 3 | `battery_pct` | u8 |
 | 4 | `profile` | u8 |
 | 5 | `boot_count` | u8 (wraps) |
 | 6 | `seq` | u16 (next notification sequence) |
-| 8 | `oldest_seq` | u16 (oldest sequence still in RAM ring) |
+| 8 | `oldest_seq` | u16 (oldest sequence still held: SD outbox if it has records, else the RAM window) |
 | 10 | `dropped` | u16 (records dropped because the ring or BLE queue was full) |
 | 12 | `device_ms` | u32 |
 | 16 | `free_heap_kb` | u16 |
-| 18 | `reserved` | u16 |
+| 18 | `outbox_count` | u16 (notifications held in the SD outbox; 0 before firmware 0.11) |
 
-Notified on state change and at 1 Hz while streaming.
+Notified on state change and at 1 Hz while connected.
 
 ## 6. Security
 - Pairing: LE Secure Connections, bonding, **passkey entry**. The device has no display, so the 6-digit passkey is fixed per device, generated randomly on first boot and kept in NVS (a factory-provisioned secret is the production alternative), and provided to the user as a QR code `swea-eb://v1?id=<deviceId>&pk=<passkey>` on the device label or in the SWEA backend. The app scans it with the existing QR scanner.
@@ -99,3 +107,6 @@ Notified on state change and at 1 Hz while streaming.
 Notification with one EDA record, seq 7, `t_ms`=531459, two samples 0.030269 and 0.030269:
 `01 07 00  45 41 02 03 1c 08 00  b2 f6 f7 3c  b2 f6 f7 3c`
 (header `ver=1 seq=7`; record `tag="EA" n=2 t_ms=0x00081C03`; two float32 0.030269.) 18 bytes total, generated with Python `struct.pack('<BH',1,7)+b'EA'+struct.pack('<BI',2,531459)+struct.pack('<ff',.030269,.030269)`. The same vector is used by the firmware host test and the app's decoder test.
+
+Reply to `FINISH` (opcode 0x0D) after a session whose last notification had seq 0x0107, without losses:
+`8d 00  07 01  00`

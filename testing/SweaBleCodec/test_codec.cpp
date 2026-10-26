@@ -198,6 +198,114 @@ int main()
 		CHECK(n == 1 + 3 + 1 && out[4] == 0);
 	}
 
+	{	// FINISH reply: last_seq:u16, flags:u8
+		uint8_t out[8];
+		CHECK(OPCODE_FINISH == 0x0D);
+		CHECK(buildFinishReply(out, sizeof(out), 0x1234, false, false) == 3);
+		CHECK(out[0] == 0x34 && out[1] == 0x12 && out[2] == 0);
+		CHECK(buildFinishReply(out, sizeof(out), 7, true, false) == 3 && out[2] == FINISH_FLAG_GAP);
+		CHECK(buildFinishReply(out, sizeof(out), 0xFFFF, false, true) == 3 && out[0] == 0xFF && out[1] == 0xFF && out[2] == FINISH_FLAG_EMPTY);
+		CHECK(buildFinishReply(out, sizeof(out), 1, true, true) == 3 && out[2] == (FINISH_FLAG_GAP | FINISH_FLAG_EMPTY));
+		CHECK(buildFinishReply(out, 2, 1, false, false) == 0);
+	}
+
+	{	// outbox record: seq:u16 len:u8 bytes
+		uint8_t data[5] = {9, 8, 7, 6, 5}, rec[16];
+		CHECK(outboxEncode(rec, 0x0102, data, sizeof(data)) == 3 + 5);
+		CHECK(rec[0] == 0x02 && rec[1] == 0x01 && rec[2] == 5 && memcmp(rec + 3, data, 5) == 0);
+	}
+
+	{	// OutboxIndex, stride 1: append, find, count, bytes
+		static uint32_t mem[16];
+		OutboxIndex ix;
+		ix.init(mem, 16, 1, 1000000);
+		CHECK(ix.count() == 0 && ix.bytes() == 0 && ix.maxRecords() == 16);
+		uint32_t off; uint16_t skip;
+		CHECK(!ix.find(5, off, skip));						// empty
+		CHECK(ix.append(100, 10) && ix.append(101, 20) && ix.append(102, 5));
+		CHECK(ix.count() == 3 && ix.firstSeq() == 100 && ix.nextSeq() == 103);
+		CHECK(ix.bytes() == (3 + 10) + (3 + 20) + (3 + 5));
+		CHECK(ix.find(100, off, skip) && off == 0 && skip == 0);
+		CHECK(ix.find(101, off, skip) && off == 13 && skip == 0);
+		CHECK(ix.find(102, off, skip) && off == 13 + 23 && skip == 0);
+		CHECK(!ix.find(99, off, skip) && !ix.find(103, off, skip));
+		CHECK(!ix.append(110, 4));							// not the next sequence
+		CHECK(ix.count() == 3);
+		CHECK(!ix.append(103, 0) && !ix.append(103, 256));	// bad lengths
+		ix.clear();
+		CHECK(ix.count() == 0 && ix.bytes() == 0 && !ix.find(100, off, skip));
+		CHECK(ix.append(500, 4) && ix.firstSeq() == 500 && ix.find(500, off, skip) && off == 0);	// a new session starts anywhere
+	}
+
+	{	// OutboxIndex, stride 4: anchors every 4th record, the caller skips forward
+		static uint32_t mem[8];
+		OutboxIndex ix;
+		ix.init(mem, 8, 4, 1000000);
+		CHECK(ix.maxRecords() == 32);
+		uint32_t expect[10], pos = 0;
+		for (int i = 0; i < 10; i++) { expect[i] = pos; CHECK(ix.append((uint16_t)(7 + i), 10 + i)); pos += 3 + 10 + i; }
+		CHECK(ix.bytes() == pos);
+		for (int i = 0; i < 10; i++)
+		{
+			uint32_t off; uint16_t skip;
+			CHECK(ix.find((uint16_t)(7 + i), off, skip));
+			CHECK(skip == (uint16_t)(i % 4) && off == expect[i - i % 4]);
+		}
+	}
+
+	{	// OutboxIndex: the sequence number wraps at 65535
+		static uint32_t mem[8];
+		OutboxIndex ix;
+		ix.init(mem, 8, 2, 1000000);
+		uint16_t s0 = 65534;
+		for (int i = 0; i < 6; i++) CHECK(ix.append((uint16_t)(s0 + i), 8));	// 65534 65535 0 1 2 3
+		CHECK(ix.firstSeq() == 65534 && ix.nextSeq() == 4);
+		uint32_t off; uint16_t skip;
+		CHECK(ix.find(65535, off, skip) && off == 0 && skip == 1);
+		CHECK(ix.find(0, off, skip) && off == 2 * 11 && skip == 0);
+		CHECK(ix.find(3, off, skip) && off == 4 * 11 && skip == 1);
+		CHECK(!ix.find(4, off, skip) && !ix.find(65533, off, skip));
+		CHECK(!ix.append(5, 8) && ix.append(4, 8));
+	}
+
+	{	// OutboxIndex: cap by record count and by bytes; capped appends are refused and counted, old data stays
+		static uint32_t mem[4];
+		OutboxIndex ix;
+		ix.init(mem, 4, 2, 1000000);						// 8 records at most
+		for (int i = 0; i < 8; i++) CHECK(ix.append((uint16_t)i, 10));
+		CHECK(!ix.canAppend(10) && !ix.append(8, 10) && !ix.append(8, 10));
+		CHECK(ix.count() == 8 && ix.dropped() == 2);
+		uint32_t off; uint16_t skip;
+		CHECK(ix.find(0, off, skip) && off == 0 && ix.find(7, off, skip) && off == 3 * 26 && skip == 1);
+		ix.clear();											// STOP: emptied, ready for a new session
+		CHECK(ix.count() == 0 && ix.canAppend(10) && ix.append(8, 10));
+
+		static uint32_t mem2[16];
+		OutboxIndex bx;
+		bx.init(mem2, 16, 1, 100);							// 100 bytes
+		CHECK(bx.append(0, 47) && bx.bytes() == 50);		// 50
+		CHECK(!bx.append(1, 48) && bx.bytes() == 50);		// 50 + 51 > 100
+		CHECK(bx.append(1, 47) && bx.bytes() == 100);		// exactly at the cap
+		CHECK(!bx.append(2, 1) && bx.dropped() == 1 + 1);
+		CHECK(bx.count() == 2);
+		OutboxIndex none;									// not initialised: nothing accepted
+		CHECK(!none.canAppend(5) && !none.append(0, 5) && none.maxRecords() == 0);
+	}
+
+	{	// OutboxIndex at the real size: 4096 slots span 16384 records
+		static uint32_t mem[OutboxIndex::DEFAULT_SLOTS];
+		OutboxIndex ix;
+		ix.init(mem, OutboxIndex::DEFAULT_SLOTS, 4, 4u * 1024 * 1024);
+		CHECK(OutboxIndex::bytesFor(OutboxIndex::DEFAULT_SLOTS) == 16384);
+		uint16_t seq = 60000;
+		int n = 0;
+		while (ix.append(seq, 200)) { seq++; n++; }			// wraps past 65535; ends at the record cap (4 MB / 203 B = 20662 > 16384)
+		CHECK(n == 16384 && ix.count() == 16384);
+		uint32_t off; uint16_t skip;
+		uint16_t probe = (uint16_t)(60000 + 12345);
+		CHECK(ix.find(probe, off, skip) && skip == 12345 % 4 && off == (uint32_t)(12345 - 12345 % 4) * 203);
+	}
+
 	printf("%d checks, %d failed\n", g_checks, g_fail);
 	return g_fail ? 1 : 0;
 }

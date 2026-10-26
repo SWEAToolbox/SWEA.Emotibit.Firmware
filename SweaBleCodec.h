@@ -269,6 +269,95 @@ namespace swea
 		return len > NOTIFICATION_HEADER_LEN ? len : 0;
 	}
 
+	/** Opcode of the FINISH command, and the flags in its reply (docs/SWEA_BLE_PROTOCOL.md). */
+	static const uint8_t OPCODE_FINISH = 0x0D;
+	static const uint8_t FINISH_FLAG_GAP = 0x01;	// frames were thrown away (outbox full or SD error) during the session
+	static const uint8_t FINISH_FLAG_EMPTY = 0x02;	// the session produced no notification at all (last_seq is meaningless)
+
+	/** FINISH reply arguments: last_seq:u16, flags:u8. Returns the length written (0 if cap < 3). */
+	inline size_t buildFinishReply(uint8_t *out, size_t cap, uint16_t lastSeq, bool gap, bool empty)
+	{
+		if (cap < 3) return 0;
+		put16(out, lastSeq);
+		out[2] = (uint8_t)((gap ? FINISH_FLAG_GAP : 0) | (empty ? FINISH_FLAG_EMPTY : 0));
+		return 3;
+	}
+
+	/** One record in /swea/outbox.bin: seq:u16 len:u8 bytes (the finished notification). Returns the length written. */
+	static const size_t OUTBOX_RECORD_OVERHEAD = 3;
+	inline size_t outboxEncode(uint8_t *out, uint16_t seq, const uint8_t *data, size_t len)
+	{
+		put16(out, seq); out[2] = (uint8_t)len;
+		memcpy(out + OUTBOX_RECORD_OVERHEAD, data, len);
+		return OUTBOX_RECORD_OVERHEAD + len;
+	}
+
+	/** Index of the SD outbox: sequence number -> file offset of the record.
+	 *  Records are appended with consecutive sequence numbers (mod 2^16), so the file position of a sequence is found
+	 *  from a table that holds the offset of every `stride`-th record; the caller reads forward from that anchor over
+	 *  `skip` records (each is seq, len, bytes). With the defaults (4096 slots, stride 4) it spans 16384 records.
+	 *  The outbox is capped by record count (slots * stride) and by file bytes. A capped append is refused and counted:
+	 *  new notifications are thrown away, the old ones stay replayable. */
+	class OutboxIndex
+	{
+	public:
+		static const size_t DEFAULT_SLOTS = 4096;
+
+		void init(uint32_t *mem, size_t slots, size_t stride, uint32_t maxBytes)
+		{
+			_off = mem; _slots = slots; _stride = stride ? stride : 1; _maxBytes = maxBytes;
+			clear();
+			_dropped = 0;
+		}
+		static constexpr size_t bytesFor(size_t slots) { return slots * sizeof(uint32_t); }
+		void clear() { _count = 0; _bytes = 0; _first = 0; }
+
+		size_t count() const { return _count; }
+		uint32_t bytes() const { return _bytes; }			// file size, also the offset of the next record
+		uint32_t dropped() const { return _dropped; }		// appends refused because of the cap
+		size_t maxRecords() const { return _off ? _slots * _stride : 0; }
+		uint16_t firstSeq() const { return _first; }		// oldest record (valid when count() > 0)
+		uint16_t nextSeq() const { return (uint16_t)(_first + _count); }
+
+		bool canAppend(size_t len) const
+		{
+			if (!_off || len == 0 || len > 255) return false;
+			if (_count >= maxRecords()) return false;
+			return (uint64_t)_bytes + OUTBOX_RECORD_OVERHEAD + len <= _maxBytes;
+		}
+
+		/** Register a record of `len` data bytes written at bytes(). Refused (false) when capped, or when seq does not
+		 *  follow the newest record. The first record after clear() starts the sequence. */
+		bool append(uint16_t seq, size_t len)
+		{
+			if (!canAppend(len)) { _dropped++; return false; }
+			if (_count == 0) _first = seq;
+			else if (seq != nextSeq()) return false;
+			if (_count % _stride == 0) _off[_count / _stride] = _bytes;
+			_count++;
+			_bytes += (uint32_t)(OUTBOX_RECORD_OVERHEAD + len);
+			return true;
+		}
+
+		bool contains(uint16_t seq) const { return (uint16_t)(seq - _first) < _count; }
+
+		/** Offset of the nearest indexed record at or before seq, and how many records to skip from there. */
+		bool find(uint16_t seq, uint32_t &anchorOffset, uint16_t &skip) const
+		{
+			if (!contains(seq)) return false;
+			size_t idx = (size_t)(uint16_t)(seq - _first);
+			anchorOffset = _off[idx / _stride];
+			skip = (uint16_t)(idx % _stride);
+			return true;
+		}
+
+	private:
+		uint32_t *_off = nullptr;
+		size_t _slots = 0, _stride = 1, _count = 0;
+		uint32_t _maxBytes = 0, _bytes = 0, _dropped = 0;
+		uint16_t _first = 0;
+	};
+
 	// GET_INFO reply arguments: proto:u8, firmware string\0, device id\0. Strings are cut to fit; both stay
 	// nul-terminated. Returns the length written (0 if cap is too small for the version byte and two nuls).
 	inline size_t buildInfoReply(uint8_t *out, size_t cap, uint8_t proto, const char *fw, const char *deviceId)

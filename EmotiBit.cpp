@@ -1280,6 +1280,9 @@ bool EmotiBit::setupSdCard(bool loadConfig)
 		return false;
 	}
 	Serial.println("card initialized.");
+#ifdef SWEA_BLE
+	_emotiBitWiFi.setSd(&SD);	// SWEA: session outbox on the SD card (/swea/outbox.bin)
+#endif
 	if (testingMode == TestingMode::ACUTE || testingMode == TestingMode::CHRONIC)
 	{
 		// list all files on SD-Card

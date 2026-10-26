@@ -6,12 +6,13 @@
 #include <Preferences.h>
 #include <time.h>
 #include <nvs.h>
+#include <FS.h>
 
 extern "C" int ble_rpa_get_num_peer_dev_records(void);
 
 // Optional fixed passkey for development builds (-DSWEA_BLE_PASSKEY=123456). Without it every device
 // generates its own random 6-digit passkey on first boot and keeps it in NVS (see loadPasskey()).
-#define SWEA_BLE_FW_STRING "swea-ble-0.10"
+#define SWEA_BLE_FW_STRING "swea-ble-0.11"
 // Longest Control notification (opcode, status and arguments). Needs an MTU above 23, which the phone always asks for.
 #define CONTROL_REPLY_MAX 64
 // RAM for the record ring (newest data is kept when it is full; the SD card keeps everything).
@@ -22,6 +23,19 @@ extern "C" int ble_rpa_get_num_peer_dev_records(void);
 #ifndef SWEA_BLE_WINDOW_FRAMES
 #define SWEA_BLE_WINDOW_FRAMES 32
 #endif
+// SD outbox of a session (notifications nobody received live): /swea/outbox.bin, capped at 4 MB and at 16384 notifications
+// (4096 index slots, every 4th notification indexed; about 20 minutes at the full profile). Once it is full, new
+// notifications are thrown away and the gap flag is raised.
+#ifndef SWEA_BLE_OUTBOX_PATH
+#define SWEA_BLE_OUTBOX_DIR "/swea"
+#define SWEA_BLE_OUTBOX_PATH "/swea/outbox.bin"
+#endif
+#ifndef SWEA_BLE_OUTBOX_MAX_BYTES
+#define SWEA_BLE_OUTBOX_MAX_BYTES (4u * 1024u * 1024u)
+#endif
+#define SWEA_BLE_OUTBOX_STRIDE 4
+// The outbox file is flushed this often (ms) while no phone is listening.
+#define SWEA_BLE_OUTBOX_SYNC_MS 2000
 // The number of bonded devices is NimBLE's own limit (CONFIG_BT_NIMBLE_MAX_BONDS in platformio.ini). When the store is full
 // NimBLE forgets the oldest bond. We do not prune ourselves: that ran before the phone's identity was known and could delete
 // the phone's own new bond.
@@ -46,7 +60,8 @@ namespace
 		OP_RECORD = 0x09,
 		OP_ENTER_PAIRING = 0x0A,
 		OP_CLEAR_BONDS = 0x0B,
-		OP_SLEEP = 0x0C
+		OP_SLEEP = 0x0C,
+		OP_FINISH = swea::OPCODE_FINISH	// 0x0D
 	};
 	enum ReplyStatus : uint8_t
 	{
@@ -248,6 +263,7 @@ int8_t SweaBleTransport::sendData(const String &message)
 
 void SweaBleTransport::handleLine(const char *s, size_t len)
 {
+	if (_finished) return;	// FINISH: no new values are taken in
 	if (!swea::parsePacketLine(s, len, _pp)) return;
 	if (_pp.tag[0] == 'B' && _pp.tag[1] == '%')
 	{
@@ -257,31 +273,48 @@ void SweaBleTransport::handleLine(const char *s, size_t len)
 	if (swea::profileAllows(_profile, _pp.tag)) _ring.push(_pp.tag, _pp.n, _pp.t_ms, _pp.v);
 }
 
-// Sends frames while a bonded phone is subscribed: first any requested replay, then new records from the ring.
+// The ring is turned into notifications here. During a session that happens whether or not a phone listens:
+//  - phone subscribed: first any requested replay (window, then SD outbox), then live frames, sent and kept in the window;
+//  - no phone, or the ring is backed up (more than 3/4 full): frames go to the SD outbox and the window instead, with
+//    the same continuous seq, and the phone fetches them later with RESUME_FROM.
 // A few frames per call keep the main loop short.
 void SweaBleTransport::drain()
 {
-	if (!_streaming || !_connected || !_encrypted || !_dataSubscribed) return;
+	if (!_session || !_ringMem) return;
 	size_t cap = _mtu > 3 ? (size_t)_mtu - 3 : 20;
-	if (cap > 244) cap = 244;
+	if (!_connected || cap > 244) cap = 244;	// nobody asked yet: the phone always negotiates an MTU of 247
+	bool live = _connected && _encrypted && _dataSubscribed;
 	uint8_t buf[244];
+
+	for (int frame = 0; frame < 6 && (!live || _ring.used() * 4 > _ring.capacity() * 3); frame++)
+		if (!produceFrame(cap)) break;
+	if (!live)
+	{
+		if (_outOpen && millis() - _outSyncMs >= SWEA_BLE_OUTBOX_SYNC_MS) { _outFile.flush(); _outSyncMs = millis(); }
+		return;
+	}
 
 	if (_replay)
 	{
+		_replayEnd = _seq;									// frames produced during the replay are part of it
 		for (int frame = 0; frame < 6 && _replay; frame++)
 		{
 			if (millis() - _lastNotifyMs < NOTIFY_SPACING_MS) break;
 			if (!swea::seqBefore(_replaySeq, _replayEnd)) { _replay = false; break; }
 			size_t l = 0;
-			if (_win.get(_replaySeq, buf, l))
+			if (_win.get(_replaySeq, buf, l) || outboxRead(_replaySeq, buf, l))
 			{
-				if (!notifyData(buf, l)) { _notifyFailures++; return; }	// retry the same frame next time
-				_lastNotifyMs = millis();
+				if (l > (size_t)_mtu - 3) _gap = true;			// cannot be delivered with this MTU
+				else
+				{
+					if (!notifyData(buf, l)) { _notifyFailures++; return; }	// retry the same frame next time
+					_lastNotifyMs = millis();
+				}
 			}
-			else _gap = true;											// fell out of the window while replaying
+			else _gap = true;									// held neither in the window nor in the outbox
 			_replaySeq++;
 		}
-		return;															// live data resumes after the replay
+		return;													// live data resumes after the replay
 	}
 
 	for (int frame = 0; frame < 6; frame++)
@@ -298,7 +331,144 @@ void SweaBleTransport::drain()
 		}
 		_win.store(_seq, buf, n);
 		_seq++;
+		_sessionFrames = true;
 		_lastNotifyMs = millis();
+	}
+}
+
+// ---- SD outbox -------------------------------------------------------------------------
+bool SweaBleTransport::outboxUsable()
+{
+	return _sd && _outIdxMem && !_outFail;
+}
+
+bool SweaBleTransport::outboxAppend(uint16_t seq, const uint8_t *data, size_t len)
+{
+	if (!outboxUsable()) return false;
+	if (!_outIdx.canAppend(len)) { _outIdx.append(seq, len); return false; }	// refused and counted
+	if (!_outOpen)
+	{
+		_sd->mkdir(SWEA_BLE_OUTBOX_DIR);
+		_outFile = _sd->open(SWEA_BLE_OUTBOX_PATH, "w+");		// truncates anything left from an earlier session
+		if (!_outFile) { _outFail = true; Serial.println("SWEA BLE: cannot open the outbox on the SD card"); return false; }
+		_outOpen = true;
+		_outSyncMs = millis();
+	}
+	uint8_t rec[swea::OUTBOX_RECORD_OVERHEAD + 244];
+	size_t n = swea::outboxEncode(rec, seq, data, len);
+	if (!_outFile.seek(_outIdx.bytes()) || _outFile.write(rec, n) != n)
+	{
+		_outFail = true;										// SD trouble: stop using the outbox, sampling and logging go on
+		_outFile.close(); _outOpen = false;
+		Serial.println("SWEA BLE: outbox write failed, outbox disabled until STOP");
+		return false;
+	}
+	_outIdx.append(seq, len);
+	return true;
+}
+
+// Reads the notification with this sequence number. Sequential reads continue from the previous position; otherwise
+// the index gives the nearest anchor and the records in between are skipped by their length bytes.
+bool SweaBleTransport::outboxRead(uint16_t seq, uint8_t *out, size_t &len)
+{
+	if (!_outOpen || !_outIdx.contains(seq)) return false;
+	uint32_t pos;
+	uint8_t h[swea::OUTBOX_RECORD_OVERHEAD];
+	if (_replayPosValid && _replayPosSeq == seq) pos = _replayPos;
+	else
+	{
+		uint16_t skip;
+		if (!_outIdx.find(seq, pos, skip)) return false;
+		for (; skip; skip--)
+		{
+			if (!_outFile.seek(pos) || _outFile.read(h, sizeof(h)) != sizeof(h)) { _replayPosValid = false; return false; }
+			pos += swea::OUTBOX_RECORD_OVERHEAD + h[2];
+		}
+	}
+	_replayPosValid = false;
+	if (!_outFile.seek(pos) || _outFile.read(h, sizeof(h)) != sizeof(h)) return false;
+	size_t l = h[2];
+	if (get16(h) != seq || l == 0 || l > 244 || _outFile.read(out, l) != l) return false;
+	len = l;
+	_replayPos = pos + swea::OUTBOX_RECORD_OVERHEAD + (uint32_t)l;
+	_replayPosSeq = (uint16_t)(seq + 1);
+	_replayPosValid = true;
+	return true;
+}
+
+void SweaBleTransport::outboxClear()
+{
+	if (_outOpen) { _outFile.close(); _outOpen = false; }
+	if (_sd && _outIdxMem && _sd->exists(SWEA_BLE_OUTBOX_PATH)) _sd->remove(SWEA_BLE_OUTBOX_PATH);
+	_outIdx.clear();
+	_outFail = false;
+	_replayPosValid = false;
+}
+
+// Turns one notification's worth of records into a frame for the outbox and the window (no phone, or a backlog).
+// False when there is nothing to do: the ring is empty or the outbox is unusable (the records then stay in the ring, which
+// keeps the newest data). When the outbox is full the frame is thrown away: seq is not used and the gap flag is raised.
+bool SweaBleTransport::produceFrame(size_t cap)
+{
+	if (!outboxUsable()) return false;
+	uint8_t buf[244];
+	size_t n = swea::buildNotification(_ring, _seq, buf, cap, _profile);
+	if (n == 0) return false;
+	if (!outboxAppend(_seq, buf, n))
+	{
+		_lost = true;
+		return !_outFail;			// full: the ring was consumed, go on discarding
+	}
+	_win.store(_seq, buf, n);
+	_seq++;
+	_sessionFrames = true;
+	return true;
+}
+
+void SweaBleTransport::beginSession()
+{
+	if (_session) return;
+	if (!_outIdxMem)
+	{
+		_outIdxMem = (uint32_t *)malloc(swea::OutboxIndex::bytesFor(swea::OutboxIndex::DEFAULT_SLOTS));
+		if (_outIdxMem) _outIdx.init(_outIdxMem, swea::OutboxIndex::DEFAULT_SLOTS, SWEA_BLE_OUTBOX_STRIDE, SWEA_BLE_OUTBOX_MAX_BYTES);
+		else Serial.println("WARNING: no memory for the outbox index; a session without a phone loses data");
+	}
+	outboxClear();
+	_finished = false;
+	_sessionFrames = false;
+	_gap = false;
+	_lost = false;
+	_session = true;
+}
+
+void SweaBleTransport::endSession()
+{
+	_session = false;
+	_replay = false;
+	_finished = false;
+	outboxClear();
+}
+
+// FINISH: stop taking in values and turn everything still in the ring into notifications. They are kept in the window
+// and the outbox (not sent here), so the phone fetches what it is missing with RESUME_FROM up to the returned last_seq.
+void SweaBleTransport::flushRing()
+{
+	_finished = true;
+	if (!_ringMem) return;
+	size_t cap = _mtu > 3 ? (size_t)_mtu - 3 : 20;
+	if (!_connected || cap > 244) cap = 244;
+	uint8_t buf[244];
+	while (!_ring.empty())
+	{
+		if (outboxUsable()) { if (!produceFrame(cap)) break; continue; }
+		// No outbox: the frames can only be kept in the window, as far as it reaches.
+		size_t n = swea::buildNotification(_ring, _seq, buf, cap, _profile);
+		if (n == 0) break;
+		_win.store(_seq, buf, n);
+		_seq++;
+		_sessionFrames = true;
+		_lost = true;
 	}
 }
 
@@ -373,6 +543,7 @@ void SweaBleTransport::startBle()
 		else Serial.println("WARNING: no memory for the resume window; RESUME_FROM can only report a gap");
 	}
 	_replay = false; _gap = false;
+	_session = false; _finished = false; _sessionFrames = false; _lost = false;
 	_cmdHead = _cmdTail = 0;
 	_ctrlHead = _ctrlTail = 0; _recording = false;
 	loadPasskey();
@@ -410,7 +581,7 @@ void SweaBleTransport::startBle()
 	adv->start();
 
 	_on = true;
-	_connected = _encrypted = _streaming = false;
+	_connected = _encrypted = false;
 	sendStatus(false);
 	Serial.print("SWEA BLE advertising as "); Serial.println(name);
 	Serial.print("SWEA BLE: bonds "); Serial.print(NimBLEDevice::getNumBonds());
@@ -422,10 +593,12 @@ void SweaBleTransport::stopBle()
 {
 	_on = false;
 	_pairingOpen = false;
-	_connected = _encrypted = _streaming = false;
+	_connected = _encrypted = false;
+	endSession();
 	NimBLEDevice::deinit(true);
 	if (_ringMem) { free(_ringMem); _ringMem = nullptr; }
 	if (_winMem) { free(_winMem); _winMem = nullptr; _win.init(nullptr, 0); }
+	if (_outIdxMem) { free(_outIdxMem); _outIdxMem = nullptr; _outIdx.init(nullptr, 0, 1, 0); }
 	g_server = nullptr; g_data = g_control = g_status = nullptr;
 }
 
@@ -445,18 +618,19 @@ void SweaBleTransport::sendStatus(bool notify)
 	if (!g_status) return;
 	uint8_t s[20] = {0};
 	s[0] = PROTOCOL_VERSION;
-	s[1] = !_on ? 0 : (_streaming ? 3 : (_connected ? 2 : 1));
+	s[1] = !_on ? 0 : (_session ? 3 : (_connected ? 2 : 1));
 	// flags: bit1 SD ok (the firmware does not start without a card), bit2 gap, bit3 low battery, bit4 pairing open.
 	// bit0 recording: as commanded over BLE.
-	s[2] = 0x02 | (_recording ? 0x01 : 0) | (_gap ? 0x04 : 0) | ((_batteryPct != 0xFF && _batteryPct < 20) ? 0x08 : 0) | (_pairingOpen ? 0x10 : 0);
+	s[2] = 0x02 | (_recording ? 0x01 : 0) | ((_gap || _lost) ? 0x04 : 0) | ((_batteryPct != 0xFF && _batteryPct < 20) ? 0x08 : 0) | (_pairingOpen ? 0x10 : 0);
 	s[3] = _batteryPct;						// 0xFF = unknown
 	s[4] = _profile;
 	s[5] = g_bootCount;
 	put16(&s[6], _seq);
-	put16(&s[8], _win.count() ? _win.oldestSeq() : _seq);
+	put16(&s[8], _outIdx.count() ? _outIdx.firstSeq() : (_win.count() ? _win.oldestSeq() : _seq));
 	put16(&s[10], (uint16_t)_ring.dropped());
 	put32(&s[12], millis());
 	put16(&s[16], (uint16_t)(ESP.getFreeHeap() / 1024));
+	put16(&s[18], (uint16_t)_outIdx.count());	// notifications held in the SD outbox
 	g_status->setValue(s, sizeof(s));
 	if (notify && _connected) g_status->notify();
 }
@@ -475,7 +649,7 @@ void SweaBleTransport::sendControlReply(uint8_t opcode, uint8_t status, const ui
 
 // ---- BLE callbacks (host task): flags only -------------------------------------------
 void SweaBleTransport::onConnected(uint16_t connHandle) { _connHandle = connHandle; _connectedAtMs = millis(); _connected = true; _encrypted = false; _dataSubscribed = false; _mtu = 23; }
-void SweaBleTransport::onDisconnected() { _connected = false; _encrypted = false; _streaming = false; _dataSubscribed = false; _replay = false; _connHandle = 0xFFFF; }
+void SweaBleTransport::onDisconnected() { _connected = false; _encrypted = false; _dataSubscribed = false; _replay = false; _connHandle = 0xFFFF; }
 void SweaBleTransport::onEncryptionChange(bool encrypted) { _encrypted = encrypted; }
 void SweaBleTransport::onMtu(uint16_t mtu) { _mtu = mtu; }
 void SweaBleTransport::onSubscribe(bool subscribed) { _dataSubscribed = subscribed; }
@@ -536,13 +710,11 @@ void SweaBleTransport::execute(const Command &c)
 	case OP_START_STREAM:
 		if (len != 2 || data[1] > 2) { sendControlReply(op, ST_BAD_ARGS, nullptr, 0); break; }
 		_profile = data[1];
-		_streaming = true;
-		_gap = false;
+		beginSession();			// no-op while a session is active (a reconnecting phone must not reset it)
 		sendControlReply(op, ST_OK, nullptr, 0);
 		break;
 	case OP_STOP_STREAM:
-		_streaming = false;
-		_replay = false;
+		endSession();			// the outbox is cleared
 		sendControlReply(op, ST_OK, nullptr, 0);
 		break;
 	case OP_TIME_SYNC:
@@ -560,10 +732,12 @@ void SweaBleTransport::execute(const Command &c)
 		uint16_t req = get16(&data[1]);
 		if (swea::seqBefore(_seq, req)) { sendControlReply(op, ST_BAD_ARGS, nullptr, 0); break; }	// asks for frames that were never sent
 		uint16_t oldest = _win.count() ? _win.oldestSeq() : _seq;
+		if (_outIdx.count() && swea::seqBefore(_outIdx.firstSeq(), oldest)) oldest = _outIdx.firstSeq();	// the outbox reaches further back
 		bool gap = swea::seqBefore(req, oldest);
 		uint16_t first = gap ? oldest : req;
 		_gap = gap;
 		_replaySeq = first;
+		_replayPosValid = false;
 		_replayEnd = _seq;
 		_replay = first != _seq;
 		uint8_t out[3];
@@ -647,6 +821,18 @@ void SweaBleTransport::execute(const Command &c)
 		Serial.print("SWEA BLE: cleared all bonds (nvs result "); Serial.print((int)err); Serial.println("), restarting");
 		delay(100);
 		ESP.restart();
+		break;
+	}
+	case OP_FINISH:
+	{
+		// End of the measurement: no new values are taken in, the ring is turned into notifications, and the reply names the
+		// last sequence number. The phone fetches what it misses with RESUME_FROM; STOP_STREAM then clears the outbox.
+		if (len != 1) { sendControlReply(op, ST_BAD_ARGS, nullptr, 0); break; }
+		if (!_session) { sendControlReply(op, ST_NOT_ALLOWED, nullptr, 0); break; }
+		if (!_finished) flushRing();
+		uint8_t out[3];
+		size_t n = swea::buildFinishReply(out, sizeof(out), (uint16_t)(_seq - 1), _gap || _lost, !_sessionFrames);
+		sendControlReply(op, ST_OK, out, n);
 		break;
 	}
 	default:

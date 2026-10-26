@@ -7,6 +7,8 @@
     the upstream sampling, SD logging and packet code is untouched.
 
     Protocol: docs/SWEA_BLE_PROTOCOL.md (version 1, draft).
+    Session mode (firmware 0.11): START_STREAM opens a session that survives disconnects; notifications are then
+    built with a continuous seq even without a phone and kept in /swea/outbox.bin on the SD card until STOP.
     Wi-Fi is never initialised in this build.
 */
 /**************************************************************************/
@@ -14,6 +16,7 @@
 #ifdef SWEA_BLE
 
 #include <Arduino.h>
+#include <FS.h>
 #include "SweaBleCodec.h"
 
 // EmotiBit.cpp compares status() against the Arduino Wi-Fi constant. No Wi-Fi header is
@@ -49,7 +52,10 @@ public:
 	static uint8_t getMaxNumCredentialAllowed();
 
 	// ---- SWEA specific ---------------------------------------------------------------
-	bool isStreaming() const { return _streaming; }
+	bool isStreaming() const { return _session; }	// a session is active (set by START_STREAM, cleared by STOP_STREAM; survives a disconnect)
+
+	/** The SD card file system (owned by EmotiBit; the Arduino SD object on the ESP32) for the session outbox. Without it the outbox is unavailable. Call once the card is up. */
+	void setSd(fs::FS *sd) { _sd = sd; }
 
 	/** Accept pairing with new phones for this many seconds (button press or ENTER_PAIRING). Prints the passkey on Serial. */
 	void openPairing(uint16_t seconds = 120);
@@ -74,7 +80,7 @@ private:
 	volatile bool _on = false;
 	volatile bool _connected = false;
 	volatile bool _encrypted = false;
-	volatile bool _streaming = false;
+	volatile bool _session = false;		// session active: notifications are built and kept even without a phone
 	volatile uint16_t _mtu = 23;
 	volatile uint16_t _connHandle = 0xFFFF;
 	volatile bool _dataSubscribed = false;
@@ -92,7 +98,29 @@ private:
 	uint8_t *_winMem = nullptr;
 	bool _replay = false;
 	uint16_t _replaySeq = 0, _replayEnd = 0;
-	bool _gap = false;					// last RESUME_FROM asked for frames that were no longer held
+	bool _gap = false;					// frames were lost: a RESUME_FROM asked for frames no longer held, or the outbox threw some away
+	bool _lost = false;					// notifications were thrown away (outbox full, no outbox) in this session
+	bool _finished = false;				// FINISH received: no new values are taken in
+	bool _sessionFrames = false;		// the session has produced at least one notification
+
+	// SD outbox (/swea/outbox.bin): records [seq:u16 len:u8 bytes] of notifications nobody received live.
+	fs::FS *_sd = nullptr;
+	fs::File _outFile;
+	bool _outOpen = false, _outFail = false;
+	swea::OutboxIndex _outIdx;
+	uint32_t *_outIdxMem = nullptr;
+	uint32_t _outSyncMs = 0;
+	bool _replayPosValid = false;		// next outbox record to replay sits at _replayPos (sequential reads need no search)
+	uint32_t _replayPos = 0;
+	uint16_t _replayPosSeq = 0;
+	bool outboxUsable();
+	bool outboxAppend(uint16_t seq, const uint8_t *data, size_t len);
+	bool outboxRead(uint16_t seq, uint8_t *out, size_t &len);
+	void outboxClear();
+	void beginSession();
+	void endSession();
+	bool produceFrame(size_t cap);
+	void flushRing();
 	swea::ParsedPacket _pp;
 	uint32_t _notifyFailures = 0;
 	uint32_t _lastNotifyMs = 0;
