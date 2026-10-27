@@ -12,6 +12,9 @@ extern "C" int ble_rpa_get_num_peer_dev_records(void);
 
 // Optional fixed passkey for development builds (-DSWEA_BLE_PASSKEY=123456). Without it every device
 // generates its own random 6-digit passkey on first boot and keeps it in NVS (see loadPasskey()).
+#ifndef SWEA_BLE_MBUF_RESERVE
+#define SWEA_BLE_MBUF_RESERVE 8
+#endif
 #define SWEA_BLE_FW_STRING "swea-ble-0.12"
 // Longest Control notification (opcode, status and arguments). Needs an MTU above 23, which the phone always asks for.
 #define CONTROL_REPLY_MAX 64
@@ -331,7 +334,7 @@ void SweaBleTransport::drain()
 	if (!_session || !_ringMem) return;
 	size_t cap = _mtu > 3 ? (size_t)_mtu - 3 : 20;
 	if (!_connected || cap > 244) cap = 244;	// nobody asked yet: the phone always negotiates an MTU of 247
-	bool live = _connected && _encrypted && _dataSubscribed;
+	bool live = _connected && _encrypted && _dataSubscribed && _streamGo;
 	uint8_t buf[244];
 
 	for (int frame = 0; frame < 6 && (!live || _ring.used() * 4 > _ring.capacity() * 3); frame++)
@@ -690,6 +693,9 @@ bool SweaBleTransport::notifyData(const uint8_t *buf, size_t len)
 	if (len > (size_t)(_mtu - 3)) return false;
 	// NimBLE-Arduino 1.4.3 notify() returns nothing, so call the host API directly: it reports
 	// back-pressure (out of mbufs) as an error and the caller keeps the records for the next try.
+	// Keep a reserve of mbufs for incoming ATT requests: when notifications use them all, the phone's Control writes fail with
+	// ATT error 0x11 (insufficient resources). The caller keeps the records and tries again.
+	if (os_msys_num_free() < SWEA_BLE_MBUF_RESERVE) return false;
 	os_mbuf *om = ble_hs_mbuf_from_flat(buf, len);
 	if (!om) return false;
 	return ble_gattc_notify_custom(_connHandle, g_data->getHandle(), om) == 0;	// takes ownership of om
@@ -730,8 +736,8 @@ void SweaBleTransport::sendControlReply(uint8_t opcode, uint8_t status, const ui
 }
 
 // ---- BLE callbacks (host task): flags only -------------------------------------------
-void SweaBleTransport::onConnected(uint16_t connHandle) { _connHandle = connHandle; _connectedAtMs = millis(); _connected = true; _encrypted = false; _dataSubscribed = false; _mtu = 23; }
-void SweaBleTransport::onDisconnected() { _connected = false; _encrypted = false; _dataSubscribed = false; _replay = false; _connHandle = 0xFFFF; }
+void SweaBleTransport::onConnected(uint16_t connHandle) { _connHandle = connHandle; _connectedAtMs = millis(); _connected = true; _encrypted = false; _dataSubscribed = false; _streamGo = false; _mtu = 23; }
+void SweaBleTransport::onDisconnected() { _streamGo = false; _connected = false; _encrypted = false; _dataSubscribed = false; _replay = false; _connHandle = 0xFFFF; }
 void SweaBleTransport::onEncryptionChange(bool encrypted) { _encrypted = encrypted; }
 void SweaBleTransport::onMtu(uint16_t mtu) { _mtu = mtu; }
 void SweaBleTransport::onSubscribe(bool subscribed) { _dataSubscribed = subscribed; }
@@ -793,6 +799,7 @@ void SweaBleTransport::execute(const Command &c)
 		if (len != 2 || data[1] > 2) { sendControlReply(op, ST_BAD_ARGS, nullptr, 0); break; }
 		_profile = data[1];
 		beginSession();			// no-op while a session is active (a reconnecting phone must not reset it)
+		_streamGo = true;		// live data and replay start only now: a reconnecting phone first does its setup on a quiet link
 		sendControlReply(op, ST_OK, nullptr, 0);
 		break;
 	case OP_STOP_STREAM:
@@ -812,6 +819,7 @@ void SweaBleTransport::execute(const Command &c)
 	{
 		if (len != 3) { sendControlReply(op, ST_BAD_ARGS, nullptr, 0); break; }
 		uint16_t req = get16(&data[1]);
+		_streamGo = true;
 		if (swea::seqBefore(_seq, req)) { sendControlReply(op, ST_BAD_ARGS, nullptr, 0); break; }	// asks for frames that were never sent
 		uint16_t oldest = _win.count() ? _win.oldestSeq() : _seq;
 		if (_outIdx.count() && swea::seqBefore(_outIdx.firstSeq(), oldest)) oldest = _outIdx.firstSeq();	// the outbox reaches further back

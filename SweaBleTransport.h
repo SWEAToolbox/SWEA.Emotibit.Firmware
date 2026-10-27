@@ -65,7 +65,9 @@ public:
 
 	// Called from the BLE callbacks (NimBLE host task). They only set flags or queue work for update().
 	void onConnected(uint16_t connHandle);
-	void requestSecurityLater() { _securityAtMs = millis() + 4000; }
+	// An unknown phone is asked to pair only after this long: our app starts the pairing itself right after connecting (Android then asks
+	// for the passkey and the app answers); a Security Request from the board first would make Android show a consent prompt instead.
+	void requestSecurityLater() { _securityAtMs = millis() + 10000; }
 	void onDisconnected();
 	void onEncryptionChange(bool encrypted);
 	void onMtu(uint16_t mtu);
@@ -86,6 +88,7 @@ private:
 	volatile uint16_t _mtu = 23;
 	volatile uint16_t _connHandle = 0xFFFF;
 	volatile bool _dataSubscribed = false;
+	volatile bool _streamGo = false;	// live data and replay wait for START_STREAM or RESUME_FROM on each connection
 	volatile bool _pairingOpen = false;
 	uint32_t _pairingUntil = 0;
 	uint32_t _passkey = 0;
