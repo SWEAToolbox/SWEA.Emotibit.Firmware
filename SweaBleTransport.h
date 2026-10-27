@@ -108,7 +108,7 @@ private:
 	// SD outbox (/swea/outbox.bin): records [seq:u16 len:u8 bytes] of notifications nobody received live.
 	fs::FS *_sd = nullptr;
 	fs::File _outFile;
-	bool _outOpen = false, _outFail = false;
+	bool _outOpen = false, _outFail = false, _outSeeding = false;
 	swea::OutboxIndex _outIdx;
 	uint32_t *_outIdxMem = nullptr;
 	uint32_t _outSyncMs = 0;
@@ -117,6 +117,7 @@ private:
 	uint16_t _replayPosSeq = 0;
 	bool outboxUsable();
 	bool outboxAppend(uint16_t seq, const uint8_t *data, size_t len);
+	void outboxSeedFromWindow(uint16_t beforeSeq);
 	bool outboxRead(uint16_t seq, uint8_t *out, size_t &len);
 	void outboxClear();
 	void beginSession();

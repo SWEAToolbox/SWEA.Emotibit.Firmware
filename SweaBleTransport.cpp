@@ -21,7 +21,7 @@ extern "C" int ble_rpa_get_num_peer_dev_records(void);
 #endif
 // Sent notifications kept for RESUME_FROM (about 250 bytes each).
 #ifndef SWEA_BLE_WINDOW_FRAMES
-#define SWEA_BLE_WINDOW_FRAMES 32
+#define SWEA_BLE_WINDOW_FRAMES 128
 #endif
 // SD outbox of a session (notifications nobody received live): /swea/outbox.bin, capped at 4 MB and at 16384 notifications
 // (4096 index slots, every 4th notification indexed; about 20 minutes at the full profile). Once it is full, new
@@ -378,6 +378,7 @@ void SweaBleTransport::drain()
 			break;
 		}
 		_win.store(_seq, buf, n);
+		if (_outIdx.count()) outboxAppend(_seq, buf, n);	// an undelivered outbox run goes on without a hole (the phone may not have asked for it yet)
 		_seq++;
 		_sessionFrames = true;
 		_lastNotifyMs = millis();
@@ -390,9 +391,28 @@ bool SweaBleTransport::outboxUsable()
 	return _sd && _outIdxMem && !_outFail;
 }
 
+void SweaBleTransport::outboxSeedFromWindow(uint16_t beforeSeq)
+{
+	_outSeeding = true;
+	uint8_t buf[244];
+	for (uint16_t s = _win.oldestSeq(); swea::seqBefore(s, beforeSeq); s++)
+	{
+		size_t l = 0;
+		if (!_win.get(s, buf, l) || l == 0 || l > sizeof(buf) || !outboxAppend(s, buf, l)) break;
+	}
+	_outSeeding = false;
+	if (_outIdx.count() && beforeSeq != _outIdx.nextSeq()) { _outIdx.clear(); _replayPosValid = false; }	// not contiguous after all: start at beforeSeq
+}
+
 bool SweaBleTransport::outboxAppend(uint16_t seq, const uint8_t *data, size_t len)
 {
 	if (!outboxUsable()) return false;
+	// The outbox holds one contiguous run of seq numbers. Frames sent live in between are not in it: when this frame does not
+	// follow the newest record, the old run was delivered (or is covered by the window) and a new run starts here.
+	if (_outIdx.count() && seq != _outIdx.nextSeq()) { _outIdx.clear(); _replayPosValid = false; }
+	// A new run starts here: first take over the frames that were sent live but never acknowledged (they may have gone into a
+	// link that was already dead, 3-4 s before the drop was noticed), so the phone can fetch them with RESUME_FROM.
+	if (_outIdx.count() == 0 && !_outSeeding && _win.count()) outboxSeedFromWindow(seq);
 	if (!_outIdx.canAppend(len)) { _outIdx.append(seq, len); return false; }	// refused and counted
 	if (!_outOpen)
 	{
@@ -404,7 +424,8 @@ bool SweaBleTransport::outboxAppend(uint16_t seq, const uint8_t *data, size_t le
 	}
 	uint8_t rec[swea::OUTBOX_RECORD_OVERHEAD + 244];
 	size_t n = swea::outboxEncode(rec, seq, data, len);
-	if (!_outFile.seek(_outIdx.bytes()) || _outFile.write(rec, n) != n)
+	// FAT seeks walk the cluster chain (slow on a long file): seek only when the file is not already at the write position.
+	if ((_outFile.position() != _outIdx.bytes() && !_outFile.seek(_outIdx.bytes())) || _outFile.write(rec, n) != n)
 	{
 		_outFail = true;										// SD trouble: stop using the outbox, sampling and logging go on
 		_outFile.close(); _outOpen = false;
@@ -434,7 +455,7 @@ bool SweaBleTransport::outboxRead(uint16_t seq, uint8_t *out, size_t &len)
 		}
 	}
 	_replayPosValid = false;
-	if (!_outFile.seek(pos) || _outFile.read(h, sizeof(h)) != sizeof(h)) return false;
+	if ((_outFile.position() != pos && !_outFile.seek(pos)) || _outFile.read(h, sizeof(h)) != sizeof(h)) return false;
 	size_t l = h[2];
 	if (get16(h) != seq || l == 0 || l > 244 || _outFile.read(out, l) != l) return false;
 	len = l;
@@ -580,7 +601,13 @@ void SweaBleTransport::loadPasskey()
 void SweaBleTransport::startBle()
 {
 	g_owner = this;
-	g_bootCount++;
+	// The boot counter lives in NVS so that a restart is visible in the data (device_ms and seq start over). 1..255, never 0.
+	{
+		Preferences prefs;
+		uint8_t boot = 0;
+		if (prefs.begin("swea_ble", false)) { boot = prefs.getUChar("boot", 0); boot = (uint8_t)(boot == 255 ? 1 : boot + 1); prefs.putUChar("boot", boot); prefs.end(); }
+		g_bootCount = boot ? boot : (uint8_t)(g_bootCount + 1);	// NVS unavailable: at least count restarts of the BLE stack
+	}
 	g_guard.reset();	// a reboot lifts a lockout
 	g_pairAttempt = false; g_peerBonded = false;
 	if (!_ringMem)
@@ -804,6 +831,7 @@ void SweaBleTransport::execute(const Command &c)
 	case OP_ACK:
 		if (len != 3) break;			// no reply for ACK (protocol doc)
 		_win.ack(get16(&data[1]));
+		if (_outIdx.count() && !swea::seqBefore(get16(&data[1]), (uint16_t)(_outIdx.nextSeq() - 1)) && !_replay) outboxClear();	// all of it delivered
 		break;
 	case OP_SET_PROFILE:
 		if (len != 2 || data[1] > 2) { sendControlReply(op, ST_BAD_ARGS, nullptr, 0); break; }
