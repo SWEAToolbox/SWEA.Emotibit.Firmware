@@ -88,6 +88,7 @@ private:
 	volatile uint16_t _mtu = 23;
 	volatile uint16_t _connHandle = 0xFFFF;
 	volatile bool _dataSubscribed = false;
+	volatile bool _advPending = false;	// advertising starts from the first update() of the main loop
 	volatile bool _streamGo = false;	// live data and replay wait for START_STREAM or RESUME_FROM on each connection
 	volatile bool _pairingOpen = false;
 	uint32_t _pairingUntil = 0;

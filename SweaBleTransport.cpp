@@ -9,6 +9,48 @@
 #include <FS.h>
 
 extern "C" int ble_rpa_get_num_peer_dev_records(void);
+extern "C" void *ble_rpa_get_peer_dev_records(void);
+
+extern "C" void ble_rpa_set_num_peer_dev_records(int num_rec);
+
+// NimBLE's host-based privacy resolves a phone's private address with its "peer device records", which it persists in NVS next to
+// the bonds. That persistence is unreliable (a record that gets its IRK after it was added is never written again, junk records
+// of unknown addresses take the slots), so after a restart the records of a bonded phone can lack the IRK and its new private
+// address is not recognised ("not bonded", encryption fails, the phone has to pair again). The bonds themselves are stored
+// correctly, so the records are rebuilt from them at every start: one complete record per bond that has an IRK.
+// Layout of struct ble_hs_dev_records (44 bytes): used, rand_addr_type, pseudo[6], rand[6], identity[6], then peer_sec: addr type,
+// addr[6], irk[16], flags (bit0 irk_present). The record's IRK is the byte-reversed IRK of the bond.
+#define SWEA_DEV_REC_BYTES 44
+static void swea_rebuild_peer_records()
+{
+	uint8_t *recs = (uint8_t *)ble_rpa_get_peer_dev_records();
+	if (!recs) return;
+	memset(recs, 0, SWEA_DEV_REC_BYTES * (CONFIG_BT_NIMBLE_MAX_BONDS + 1));
+	int out = 0, n = NimBLEDevice::getNumBonds();
+	for (int i = 0; i < n && out < CONFIG_BT_NIMBLE_MAX_BONDS; i++)
+	{
+		NimBLEAddress a = NimBLEDevice::getBondedAddress(i);
+		struct ble_store_key_sec key;
+		struct ble_store_value_sec val;
+		memset(&key, 0, sizeof(key)); memset(&val, 0, sizeof(val));
+		key.peer_addr.type = a.getType();
+		memcpy(key.peer_addr.val, a.getNative(), 6);
+		if (ble_store_read_peer_sec(&key, &val) != 0 || !val.irk_present) continue;
+		uint8_t *r = recs + out * SWEA_DEV_REC_BYTES;
+		r[0] = 1;									// rec_used
+		r[1] = BLE_ADDR_RANDOM;						// rand_addr_type (set again when a private address resolves)
+		memcpy(r + 2, a.getNative(), 6);			// pseudo
+		memcpy(r + 8, a.getNative(), 6);			// rand
+		memcpy(r + 14, a.getNative(), 6);			// identity
+		r[20] = a.getType();
+		memcpy(r + 21, a.getNative(), 6);
+		for (int k = 0; k < 16; k++) r[27 + k] = val.irk[15 - k];
+		r[43] = 1;									// irk_present
+		out++;
+	}
+	ble_rpa_set_num_peer_dev_records(out);
+	Serial.print("SWEA BLE: rebuilt "); Serial.print(out); Serial.println(" peer record(s) from the bonds");
+}
 
 // Optional fixed passkey for development builds (-DSWEA_BLE_PASSKEY=123456). Without it every device
 // generates its own random 6-digit passkey on first boot and keeps it in NVS (see loadPasskey()).
@@ -247,6 +289,12 @@ int8_t SweaBleTransport::update(String &, uint16_t &)
 {
 	if (!_on) return 0;
 	uint32_t now = millis();
+	if (_advPending)
+	{
+		_advPending = false;
+		NimBLEDevice::startAdvertising();
+		Serial.println("SWEA BLE: advertising started (main loop is running)");
+	}
 
 	if (_pairingOpen && (int32_t)(now - _pairingUntil) >= 0)
 	{
@@ -636,6 +684,7 @@ void SweaBleTransport::startBle()
 	String name = "EmotiBit-" + suffix;
 
 	NimBLEDevice::init(name.c_str());
+	swea_rebuild_peer_records();	// before the first connection can arrive
 	NimBLEDevice::setMTU(247);
 	NimBLEDevice::setSecurityAuth(true, true, true);			// bonding, MITM protection, LE Secure Connections
 	NimBLEDevice::setSecurityIOCap(BLE_HS_IO_DISPLAY_ONLY);	// passkey is shown on the label / QR code
@@ -663,7 +712,10 @@ void SweaBleTransport::startBle()
 	NimBLEAdvertising *adv = NimBLEDevice::getAdvertising();
 	adv->addServiceUUID(SERVICE_UUID);	// advertising carries only the service UUID and the short name
 	adv->setScanResponse(true);
-	adv->start();
+	// Advertising starts from the first update() in the main loop, not here: this runs inside EmotiBit::setup(), which keeps going for
+	// several seconds (SD card, sensors). A phone that reconnects the moment the board shows up would otherwise get a link that
+	// nobody serves yet (no commands, no encryption timers) and give up on it.
+	_advPending = true;
 
 	_on = true;
 	_connected = _encrypted = false;
