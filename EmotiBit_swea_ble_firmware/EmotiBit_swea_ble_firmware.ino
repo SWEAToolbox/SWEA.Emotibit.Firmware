@@ -1,5 +1,9 @@
 #include <Arduino.h>
 #include "EmotiBit.h"
+#ifdef SWEA_OLED
+#include "SweaDisplay.h"
+SweaDisplay display;
+#endif
 
 #define SerialUSB SERIAL_PORT_USBVIRTUAL // Required to work in Visual Micro / Visual Studio IDE
 const uint32_t SERIAL_BAUD = 2000000; //115200
@@ -58,12 +62,21 @@ void setup()
 	// Attach callback functions
 	emotibit.attachShortButtonPress(&onShortButtonPress);
 	emotibit.attachLongButtonPress(&onLongButtonPress);
+#ifdef SWEA_OLED
+	display.begin();	// no-op without the OLED FeatherWing
+#endif
 }
 
 void loop()
 {
 	//Serial.println("emotibit.update()");
 	emotibit.update();
+
+#ifdef SWEA_OLED
+	// OLED: newest EDA sample (uS). readData() is a one-shot read, so EDA is read here and nowhere else.
+	size_t edaAvailable = emotibit.readData(EmotiBit::DataType::EDA, &data[0], dataSize);
+	display.update(emotibit._emotiBitWiFi, &data[0], edaAvailable < dataSize ? edaAvailable : dataSize);
+#endif
 
 	size_t dataAvailable = emotibit.readData(EmotiBit::DataType::PPG_GREEN, &data[0], dataSize);
 	if (dataAvailable > 0)

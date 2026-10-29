@@ -75,6 +75,16 @@ public:
 	void onControlWrite(const uint8_t *data, size_t len);
 	uint32_t passkey() const { return _passkey; }
 
+	/** Milliseconds since the current link was established; 0 when not connected (OLED "Time connected"). */
+	uint32_t connectedMs() const { return _connected ? (uint32_t)(millis() - _linkUpMs) : 0; }
+
+	/** Battery percentage from the latest B% record; 0xFF until one has been seen (OLED battery). */
+	uint8_t batteryPct() const { return _batteryPct; }
+
+	/** Creates an event marker from the device itself (OLED button A): the same UN packet MARK_EVENT creates. It is logged on the SD
+	 *  card and reaches the phone in the data stream. False if the control queue is full. */
+	bool markEvent(uint8_t code) { return pushControlPacket("0,0,1,UN,1,100," + String((unsigned)code)); }
+
 private:
 	static const uint8_t CMD_QUEUE = 4;
 	static const uint8_t CMD_MAX_LEN = 8;
@@ -132,6 +142,7 @@ private:
 	uint32_t _notifyFailures = 0;
 	uint32_t _lastNotifyMs = 0;
 	uint32_t _connectedAtMs = 0;
+	uint32_t _linkUpMs = 0;				// when the current link came up (unlike _connectedAtMs it is not reset by the encryption timeout)
 	uint32_t _securityAtMs = 0;
 	bool _recording = false;				// as commanded over BLE (RECORD); the SD card state is owned by EmotiBit
 	static const uint8_t CTRL_OUT = 4;

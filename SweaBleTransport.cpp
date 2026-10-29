@@ -788,7 +788,7 @@ void SweaBleTransport::sendControlReply(uint8_t opcode, uint8_t status, const ui
 }
 
 // ---- BLE callbacks (host task): flags only -------------------------------------------
-void SweaBleTransport::onConnected(uint16_t connHandle) { _connHandle = connHandle; _connectedAtMs = millis(); _connected = true; _encrypted = false; _dataSubscribed = false; _streamGo = false; _mtu = 23; }
+void SweaBleTransport::onConnected(uint16_t connHandle) { _connHandle = connHandle; _connectedAtMs = _linkUpMs = millis(); _connected = true; _encrypted = false; _dataSubscribed = false; _streamGo = false; _mtu = 23; }
 void SweaBleTransport::onDisconnected() { _streamGo = false; _connected = false; _encrypted = false; _dataSubscribed = false; _replay = false; _connHandle = 0xFFFF; }
 void SweaBleTransport::onEncryptionChange(bool encrypted) { _encrypted = encrypted; }
 void SweaBleTransport::onMtu(uint16_t mtu) { _mtu = mtu; }

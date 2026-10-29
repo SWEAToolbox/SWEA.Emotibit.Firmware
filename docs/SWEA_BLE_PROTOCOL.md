@@ -62,7 +62,7 @@ Write: `opcode:u8, args...`. The device answers by notifying `0x80 | opcode, sta
 | 0x05 | `RESUME_FROM` | `seq:u16` | `first_replayed_seq:u16, flags:u8` |
 | 0x06 | `ACK` | `seq:u16` | – (no reply needed; reply suppressed) |
 | 0x07 | `SET_PROFILE` | `profile:u8` (0..2) | – (implemented in firmware 0.2) |
-| 0x08 | `MARK_EVENT` | `code:u8` | `device_ms:u32`. The marker is written to the SD card as a `UN` packet and comes back in the data stream as a `UN` record with the code as its value (implemented in firmware 0.4) |
+| 0x08 | `MARK_EVENT` | `code:u8` | `device_ms:u32`. The marker is written to the SD card as a `UN` packet and comes back in the data stream as a `UN` record with the code as its value (implemented in firmware 0.4). A `UN` record can also originate on the device: the OLED build (`SWEA_OLED`) creates one when button A is pressed, through the same path and with a running code 1..255 |
 | 0x09 | `RECORD` | off: `0`. on: `1, utc_seconds:u32, milliseconds:u16` | – . Starts/stops SD recording exactly like the Oscilloscope's `RB`/`RE` packets; the files are named `YYYY-MM-DD_HH-MM-SS-mmm.csv` (UTC) from the time given. A time before 2020 is refused (status 1). Implemented in firmware 0.4; `Status.flags` bit0 reports the commanded state |
 | 0x0A | `ENTER_PAIRING` | `seconds:u8` | – (only accepted while bonded; button also opens pairing; since 0.12 pairing works without it, see section 6) |
 | 0x0B | `CLEAR_BONDS` | – | – |
