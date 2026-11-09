@@ -21,7 +21,14 @@
 #include <SparkFun_MLX90632_Arduino_Library.h>
 #include "DoubleBufferFloat.h"
 #include <ArduinoJson.h>
+#ifdef SWEA_BLE
+// SWEA: BLE transport replaces Wi-Fi (see SweaBleTransport.h, docs/SWEA_BLE_PROTOCOL.md)
+#include "SweaBleTransport.h"
+#include "EmotiBitPacket.h"
+typedef SweaBleTransport EmotiBitWiFi;
+#else
 #include "EmotiBitWiFi.h"
+#endif
 #include <SPI.h>
 #ifdef ARDUINO_FEATHER_ESP32
 #include <SD.h>

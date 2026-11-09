@@ -1,3 +1,4 @@
+#ifndef SWEA_BLE // SWEA: Wi-Fi transport is not built for the BLE firmware
 #include "EmotiBitWiFi.h"
 #ifdef ADAFRUIT_FEATHER_M0
 #include <driver/source/nmasic.h>
@@ -846,3 +847,4 @@ uint8_t EmotiBitWiFi::getMaxNumCredentialAllowed()
 {
 	return MAX_CREDENTIALS;
 }
+#endif // SWEA_BLE
